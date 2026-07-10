@@ -42,3 +42,9 @@ desktop.ini
 coverage/
 *.profraw
 *.profdata
+
+# Local benchmark scratch
+.bench-nats-store/
+.bench-nats.log
+.bench-worker.log
+.bench-*.log

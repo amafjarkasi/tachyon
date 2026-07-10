@@ -1,5 +1,4 @@
 const std = @import("std");
-const logging = @import("logging.zig");
 
 /// Default job payload shape used by producer / worker.
 pub const Job = struct {
@@ -12,12 +11,12 @@ pub const Job = struct {
 /// Domain handler plug-in point.
 /// Replace this body with SMTP / HTTP / DB work for your product.
 /// Returns error.Timeout if wall time exceeds job_timeout_ms (soft deadline).
+///
+/// Keep the hot path quiet: per-job stdout logging destroys throughput.
 pub fn processJob(job: Job, thread_id: usize, timeout_ms: u32, io: std.Io, progress: ?*const fn () void) !void {
+    _ = thread_id;
+    _ = job;
     const start = std.Io.Timestamp.now(io, .awake);
-
-    var msg_buf: [160]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "Processing job id={s} to={s} subject={s}", .{ job.id, job.email, job.subject }) catch "Processing job";
-    logging.logJSON("info", thread_id, msg);
 
     if (progress) |p| p();
 
