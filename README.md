@@ -52,6 +52,18 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 *   **How it works:** Each worker thread maintains a running average of execution latency. If average task processing times exceed `200ms` (indicating backend database load or third-party API throttling), the worker automatically scales down the requested batch size for its next pull command. Once execution latency falls below `50ms`, the pull batch size expands back to the configured limit.
 *   **Benefit:** Natural backpressure feedback that prevents overload, mitigates head-of-line blocking, and ensures smooth runtime execution.
 
+### 10. Structured JSON Logging
+*   **How it works:** Every operational log event emitted by Tachyon is formatted as a machine-readable JSON object: `{"level":"info","thread_id":2,"message":"..."}`. Log levels include `info`, `warn`, and `error`, and each entry includes the originating thread ID where applicable.
+*   **Benefit:** Enables direct ingestion by cloud-native log aggregators (e.g. Datadog, Loki, CloudWatch, Google Cloud Logging) without any additional parsing plugins or sidecars.
+
+### 11. Graceful Shutdown (SIGINT / Ctrl+C Handler)
+*   **How it works:** Registers a native OS signal handler (`SetConsoleCtrlHandler` on Windows, `SIGINT`/`SIGTERM` on POSIX). When a shutdown signal is received, a global atomic `should_shutdown` flag is set to `true`. All worker threads detect this flag at the top of their pull loop and exit cleanly after finishing any in-progress job. The metrics server also drains cleanly.
+*   **Benefit:** Guarantees zero mid-job data loss on deployments and rolling restarts. Kubernetes `SIGTERM` graceful termination windows are fully respected.
+
+### 12. Per-Job SLA Latency Alerting
+*   **How it works:** Each job is individually timed from pull acknowledgment to completion using `std.Io.Timestamp`. If a single job execution exceeds **500ms**, a `warn`-level structured log entry is emitted: `{"level":"warn","message":"Job SLA violated: 823ms execution time"}`.
+*   **Benefit:** Provides instant, zero-configuration visibility into outlier jobs and downstream service degradation without requiring external APM tooling.
+
 ---
 
 ## 🏗️ System Architecture
@@ -521,9 +533,17 @@ pub fn workerThreadRun(ctx: *WorkerContext) void {
 
 ---
 
-## ⚙️ Configuration File (`config.json`)
+## ⚙️ Configuration Reference
 
-Deploy a `config.json` in your working directory to customize the connection:
+Tachyon uses a **three-layer precedence system**: CLI flags override environment variables, which override `config.json`, which overrides built-in defaults.
+
+### Priority Order
+```
+CLI Flags  >  Environment Variables  >  config.json  >  Defaults
+```
+
+### `config.json` File
+Deploy a `config.json` in your working directory:
 
 ```json
 {
@@ -536,6 +556,40 @@ Deploy a `config.json` in your working directory to customize the connection:
     "worker_threads": 4,
     "worker_batch": 100
 }
+```
+
+### Environment Variable Overrides
+All config fields can be overridden by setting the following environment variables before launching the worker binary:
+
+| Environment Variable | Type | Example | Description |
+| :--- | :--- | :--- | :--- |
+| `NATS_HOST` | `string` | `nats.prod.internal` | NATS broker hostname or IP |
+| `NATS_PORT` | `integer` | `4222` | NATS broker port |
+| `NATS_USER` | `string` | `tachyon_svc` | NATS username for authentication |
+| `NATS_PASS` | `string` | `s3cr3t` | NATS password for authentication |
+| `NATS_TLS` | `bool` | `true` | Enable TLS encrypted transport |
+| `NATS_CA` | `string` | `/etc/certs/ca.pem` | Path to custom CA certificate bundle |
+
+### CLI Flag Reference
+Flags are parsed last and override all other configuration sources:
+
+```
+Usage:
+  worker.exe [options]
+
+Options:
+  -t, --threads <n>    Number of concurrent worker threads (default: 4, max auto-scale: 8)
+  -b, --batch <n>      JetStream pull consumer batch size per request (default: 50)
+  -h, --help           Print this help guide and exit
+```
+
+**Examples:**
+```bash
+# Run 8 threads with a batch of 200 messages
+worker.exe --threads 8 --batch 200
+
+# Override NATS host via env, use default threads
+NATS_HOST=nats.cluster.local worker.exe --batch 100
 ```
 
 ---
