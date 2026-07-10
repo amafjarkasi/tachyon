@@ -50,12 +50,19 @@ const MetricsContext = struct {
 
 const CTRL_C_EVENT = 0;
 const CTRL_BREAK_EVENT = 1;
-const TRUE = 1;
-const FALSE = 0;
+
+// Zero-allocation structured JSON logger (timestamp omitted; wire to Io.Timestamp if needed)
+fn logJSON(level: []const u8, thread_id: ?usize, msg: []const u8) void {
+    if (thread_id) |tid| {
+        std.debug.print("{{\"level\":\"{s}\",\"thread_id\":{d},\"message\":\"{s}\"}}\n", .{ level, tid, msg });
+    } else {
+        std.debug.print("{{\"level\":\"{s}\",\"message\":\"{s}\"}}\n", .{ level, msg });
+    }
+}
 
 fn ctrlHandler(ctrl_type: windows.DWORD) callconv(std.builtin.CallingConvention.winapi) windows.BOOL {
     if (ctrl_type == CTRL_C_EVENT or ctrl_type == CTRL_BREAK_EVENT) {
-        std.debug.print("\n[System] Shutdown signal received. Draining workers gracefully...\n", .{});
+        logJSON("info", null, "Shutdown signal received. Draining workers gracefully...");
         should_shutdown.store(true, .monotonic);
         return .TRUE;
     }
@@ -88,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         try file_reader.interface.readSliceAll(file_buf);
         parsed_config = try std.json.parseFromSlice(AppConfig, allocator, file_buf, .{});
         app_config = parsed_config.?.value;
-        std.debug.print("Successfully loaded configuration from config.json!\n", .{});
+        logJSON("info", null, "Successfully loaded configuration from config.json");
     } else |_| {
         // config.json not found, use defaults
     }
@@ -152,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    std.debug.print("Initializing NATS JetStream Stream & Consumer...\n", .{});
+    logJSON("info", null, "Initializing NATS JetStream Stream & Consumers...");
     // Initialize stream and consumers once from main connection
     {
         var init_client = try NatsClient.connect(io, allocator, config);
@@ -176,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
     const metrics_thread = try std.Thread.spawn(.{}, metricsServerRun, .{metrics_ctx});
     metrics_thread.detach();
 
-    std.debug.print("Spawning {d} worker threads (batch size: {d})...\n", .{ num_threads, batch_size });
+    logJSON("info", null, "Spawning worker threads...");
 
     // Use ArrayList to allow dynamic worker auto-scaling
     var active_threads = std.ArrayList(std.Thread).empty;
@@ -200,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Monitor thread that prints throughput once a second
-    std.debug.print("Monitoring throughput. Press Ctrl+C to stop.\n", .{});
+    logJSON("info", null, "Monitoring throughput started.");
     var last_count: usize = 0;
     const start_time = std.Io.Timestamp.now(io, .awake);
     const max_threads: usize = 8;
@@ -217,12 +224,16 @@ pub fn main(init: std.process.Init) !void {
             const elapsed = @as(f64, @floatFromInt(elapsed_duration.toMilliseconds())) / 1000.0;
             const avg_rate = @as(f64, @floatFromInt(current_count)) / elapsed;
             const active_count = target_threads.load(.monotonic);
-            std.debug.print("Jobs Processed: {d} | Rate: {d} jobs/sec | Avg: {d:.2} jobs/sec | Active Threads: {d}\n", .{ current_count, diff, avg_rate, active_count });
+            
+            // Format log message
+            var log_msg_buf: [128]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_msg_buf, "Throughput: {d} jobs/sec | Avg: {d:.2} jobs/sec | Active: {d}", .{ diff, avg_rate, active_count }) catch continue;
+            logJSON("info", null, log_msg);
 
             // Dynamic Worker Thread Auto-Scaling UP
             if (diff > 30000 and active_count < max_threads) {
                 const new_id = active_count + 1;
-                std.debug.print("[System] High throughput detected ({d} jobs/sec). Dynamically scaling worker pool UP to {d} threads...\n", .{ diff, new_id });
+                logJSON("info", null, "High throughput detected. Scaling worker pool UP.");
                 _ = target_threads.fetchAdd(1, .monotonic);
                 
                 const ctx = try allocator.create(WorkerContext);
@@ -239,14 +250,13 @@ pub fn main(init: std.process.Init) !void {
 
             // Dynamic Worker Thread Auto-Scaling DOWN
             if (diff < 5000 and active_count > min_threads) {
-                const new_id = active_count - 1;
-                std.debug.print("[System] Low throughput detected ({d} jobs/sec). Dynamically scaling worker pool DOWN to {d} threads...\n", .{ diff, new_id });
                 _ = target_threads.fetchSub(1, .monotonic);
+                logJSON("info", null, "Low throughput detected. Scaling worker pool DOWN.");
             }
         }
     }
 
-    std.debug.print("[System] Main thread shutdown. Draining active worker threads...\n", .{});
+    logJSON("info", null, "Main thread shutdown. Draining active worker threads...");
 }
 
 fn workerRun(ctx: *WorkerContext) void {
@@ -269,13 +279,15 @@ fn workerRun(ctx: *WorkerContext) void {
     while (!should_shutdown.load(.monotonic)) {
         // Dynamic down-scaling exit condition
         if (ctx.thread_id > target_threads.load(.monotonic)) {
-            std.debug.print("[Thread {d}] Scale-down signal received. Exiting thread...\n", .{ctx.thread_id});
+            logJSON("info", ctx.thread_id, "Scale-down signal received. Exiting thread.");
             break;
         }
 
         // Connect local client with backoff reconnect
         var client = NatsClient.connect(ctx.io, ctx.allocator, ctx.config) catch |err| {
-            std.debug.print("[Thread {d}] Connection failed: {}. Reconnecting in {d}ms...\n", .{ ctx.thread_id, err, backoff_ms });
+            var err_buf: [64]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Connection failed: {}. Retrying...", .{err}) catch "Connection failed. Retrying...";
+            logJSON("warn", ctx.thread_id, err_msg);
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
             backoff_ms = @min(backoff_ms * 2, 30000);
             continue;
@@ -285,7 +297,9 @@ fn workerRun(ctx: *WorkerContext) void {
         defer client.deinit();
 
         client.subscribe(inbox, "1") catch |err| {
-            std.debug.print("[Thread {d}] Subscription failed: {}. Reconnecting...\n", .{ ctx.thread_id, err });
+            var err_buf: [64]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Subscription failed: {}. Reconnecting...", .{err}) catch "Subscription failed.";
+            logJSON("warn", ctx.thread_id, err_msg);
             continue;
         };
 
@@ -297,8 +311,10 @@ fn workerRun(ctx: *WorkerContext) void {
 
             // Priority Queue Routing: Poll WORKER_HIGH first
             client.requestNext("JOBS", "WORKER_HIGH", inbox, adaptive_batch) catch |err| {
-                std.debug.print("[Thread {d}] requestNext (high) failed: {}. Reconnecting...\n", .{ ctx.thread_id, err });
-                break; // Break inner loop to reconnect
+                var err_buf: [64]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (high) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
+                logJSON("warn", ctx.thread_id, err_msg);
+                break;
             };
 
             // Pull batch loop
@@ -310,7 +326,9 @@ fn workerRun(ctx: *WorkerContext) void {
             while (msg_count < adaptive_batch) : (msg_count += 1) {
                 var msg = client.readMsg() catch |err| {
                     if (!should_shutdown.load(.monotonic)) {
-                        std.debug.print("[Thread {d}] Connection lost during read: {}. Reconnecting...\n", .{ ctx.thread_id, err });
+                        var err_buf: [64]u8 = undefined;
+                        const err_msg = std.fmt.bufPrint(&err_buf, "Connection lost during read: {}.", .{err}) catch "Connection lost.";
+                        logJSON("warn", ctx.thread_id, err_msg);
                     }
                     break;
                 };
@@ -331,7 +349,7 @@ fn workerRun(ctx: *WorkerContext) void {
 
                 // Deserialize payload using the reusable arena allocator
                 const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
-                    std.debug.print("[Thread {d}] Job parsing failed. Pushing payload to DLQ 'jobs.failed'...\n", .{ctx.thread_id});
+                    logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ 'jobs.failed'.");
                     client.publish("jobs.failed", null, msg.payload) catch {};
                     client.ack(&msg) catch {};
                     _ = job_arena.reset(.retain_capacity);
@@ -355,7 +373,9 @@ fn workerRun(ctx: *WorkerContext) void {
                 processed_in_batch += 1;
 
                 if (latency_ms > 500) {
-                    std.debug.print("[Thread {d}] WARNING: Job latency threshold exceeded: {d}ms\n", .{ ctx.thread_id, latency_ms });
+                    var lat_buf: [64]u8 = undefined;
+                    const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
+                    logJSON("warn", ctx.thread_id, lat_msg);
                 }
 
                 // Reset arena for the next job, retaining memory capacity (Zero Allocations!)
@@ -369,7 +389,9 @@ fn workerRun(ctx: *WorkerContext) void {
                 }
 
                 client.requestNext("JOBS", "WORKER_LOW", inbox, adaptive_batch) catch |err| {
-                    std.debug.print("[Thread {d}] requestNext (low) failed: {}. Reconnecting...\n", .{ ctx.thread_id, err });
+                    var err_buf: [64]u8 = undefined;
+                    const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (low) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
+                    logJSON("warn", ctx.thread_id, err_msg);
                     break;
                 };
 
@@ -377,7 +399,9 @@ fn workerRun(ctx: *WorkerContext) void {
                 while (msg_count < adaptive_batch) : (msg_count += 1) {
                     var msg = client.readMsg() catch |err| {
                         if (!should_shutdown.load(.monotonic)) {
-                            std.debug.print("[Thread {d}] Connection lost during read: {}. Reconnecting...\n", .{ ctx.thread_id, err });
+                            var err_buf: [64]u8 = undefined;
+                            const err_msg = std.fmt.bufPrint(&err_buf, "Connection lost during read: {}.", .{err}) catch "Connection lost.";
+                            logJSON("warn", ctx.thread_id, err_msg);
                         }
                         break;
                     };
@@ -394,7 +418,7 @@ fn workerRun(ctx: *WorkerContext) void {
                     const job_start = std.Io.Timestamp.now(ctx.io, .awake);
 
                     const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
-                        std.debug.print("[Thread {d}] Job parsing failed. Pushing payload to DLQ 'jobs.failed'...\n", .{ctx.thread_id});
+                        logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ 'jobs.failed'.");
                         client.publish("jobs.failed", null, msg.payload) catch {};
                         client.ack(&msg) catch {};
                         _ = job_arena.reset(.retain_capacity);
@@ -415,7 +439,9 @@ fn workerRun(ctx: *WorkerContext) void {
                     processed_in_batch += 1;
 
                     if (latency_ms > 500) {
-                        std.debug.print("[Thread {d}] WARNING: Job latency threshold exceeded: {d}ms\n", .{ ctx.thread_id, latency_ms });
+                        var lat_buf: [64]u8 = undefined;
+                        const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
+                        logJSON("warn", ctx.thread_id, lat_msg);
                     }
 
                     _ = job_arena.reset(.retain_capacity);
@@ -428,7 +454,9 @@ fn workerRun(ctx: *WorkerContext) void {
                 if (avg_latency > 200) {
                     // Throttle down batch pulling under backpressure
                     adaptive_batch = @max(adaptive_batch / 2, 1);
-                    std.debug.print("[Thread {d}] Backpressure throttle activated (avg latency: {d}ms). Batch size reduced to: {d}\n", .{ ctx.thread_id, avg_latency, adaptive_batch });
+                    var bp_buf: [64]u8 = undefined;
+                    const bp_msg = std.fmt.bufPrint(&bp_buf, "Backpressure activated. Batch size reduced to: {d}", .{adaptive_batch}) catch "Backpressure activated.";
+                    logJSON("info", ctx.thread_id, bp_msg);
                 } else if (avg_latency < 50) {
                     // Recover back to default
                     adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
@@ -437,33 +465,35 @@ fn workerRun(ctx: *WorkerContext) void {
         }
     }
 
-    std.debug.print("[Thread {d}] Exited cleanly.\n", .{ctx.thread_id});
+    logJSON("info", ctx.thread_id, "Worker thread exited cleanly.");
 }
 
 fn metricsServerRun(ctx: *MetricsContext) void {
     defer ctx.allocator.destroy(ctx);
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", 8080) catch |err| {
-        std.debug.print("[Metrics Server] Address parse error: {}\n", .{err});
+        var err_buf: [64]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Metrics Address parse error: {}", .{err}) catch "Metrics parse error.";
+        logJSON("error", null, err_msg);
         return;
     };
     var server = addr.listen(ctx.io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[Metrics Server] Listen error: {}\n", .{err});
+        var err_buf: [64]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Metrics Listen error: {}", .{err}) catch "Metrics listen error.";
+        logJSON("error", null, err_msg);
         return;
     };
 
-    std.debug.print("[Metrics Server] Listening on http://127.0.0.1:8080/metrics\n", .{});
+    logJSON("info", null, "Metrics Server listening on http://127.0.0.1:8080/metrics");
 
     while (!should_shutdown.load(.monotonic)) {
         var conn = server.accept(ctx.io) catch continue;
         defer conn.close(ctx.io);
 
-        // Read Request Header
         var read_buf: [1024]u8 = undefined;
         var r = conn.reader(ctx.io, &read_buf);
         _ = r.interface.takeDelimiter('\n') catch continue;
 
-        // Formulate metrics payload
         const count = ctx.total_jobs.load(.monotonic);
         var body_buf: [256]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf,
@@ -481,5 +511,5 @@ fn metricsServerRun(ctx: *MetricsContext) void {
         ) catch continue;
         w.interface.flush() catch continue;
     }
-    std.debug.print("[Metrics Server] Exited cleanly.\n", .{});
+    logJSON("info", null, "Metrics Server exited cleanly.");
 }

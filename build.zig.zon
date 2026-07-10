@@ -1,7 +1,7 @@
 .{
     .name = .tachyon,
     .version = "0.1.0",
-    .fingerprint = 0xcdcad68d1723b13a,
+    .fingerprint = 0x75ac4d203b163086,
     .dependencies = .{},
     .paths = .{
         "build.zig",
