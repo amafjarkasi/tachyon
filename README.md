@@ -4,7 +4,12 @@
   <img src="logo.png" alt="Tachyon Logo" width="360" />
 </p>
 
-Tachyon is a zero-dependency, ultra-high-performance background job processing library built natively in **Zig 0.16.0** and powered by **NATS JetStream**. Designed for mission-critical tasks, Tachyon scales horizontally across worker threads and utilizes zero-allocation runtime techniques to reach execution rates of nearly **100,000 jobs per second**.
+Tachyon is a zero-dependency, ultra-high-performance background job processing library built natively in **Zig 0.16.0** and powered by the **NATS JetStream** protocol. Engineered for low-latency, mission-critical systems (such as financial transaction processors, telemetry ingest engines, and microsecond-sensitive microservices), Tachyon completely bypasses heavy runtime engines, garbage collectors (GC), and third-party frameworks.
+
+### Why Tachyon?
+*   **The Zig Edge:** By leveraging Zig's precise control over memory and native target compilation, Tachyon provides deterministic, bare-metal runtime execution. There are no heap allocations on the hot path, preventing memory leaks, garbage collection pauses, and kernel context switching overhead.
+*   **NATS JetStream Power:** Instead of relying on heavy polling mechanisms or complex external databases, Tachyon integrates directly with NATS JetStream. It utilizes JetStream's lightweight, distributed message persistence, wildcard routing capabilities, and pull-based consumer APIs.
+*   **Engineered for Speed:** Using worker-isolated sockets (removing synchronization locks entirely) and reusable arena allocators, Tachyon easily achieves peak consumption rates of nearly **100,000 jobs per second** while maintaining a flat memory profile of less than 5 MB under full load.
 
 ---
 
@@ -39,13 +44,46 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 *   **How it works:** Conditionally wraps the TCP stream in a `std.crypto.tls.Client` using secure system entropy from `std.Io.randomSecure` for the cryptographic handshake. It supports loading root certs via `std.crypto.Certificate.Bundle` for CA validation and serializes authentication fields into the NATS JSON CONNECT handshake.
 *   **Benefit:** Secures internal message traffic and meets enterprise requirements for encrypted transit (TLS/SSL) and access control.
 
+### 8. Multi-Queue Priority Routing
+*   **How it works:** Spawns distinct JetStream consumer groups (`WORKER_HIGH` and `WORKER_LOW`) bound to specific subject wildcards (`jobs.high.*` and `jobs.low.*`). Each worker thread attempts to pull from the high-priority queue first; it falls back to request tasks from the low-priority queue only when NATS returns status headers indicating the high-priority queue is empty.
+*   **Benefit:** Guarantees critical jobs (e.g. transactional payments) are processed immediately, preventing low-priority tasks (e.g. non-critical notifications) from causing resource starvation.
+
+### 9. Latency-Based Adaptive Batching (Backpressure Control)
+*   **How it works:** Each worker thread maintains a running average of execution latency. If average task processing times exceed `200ms` (indicating backend database load or third-party API throttling), the worker automatically scales down the requested batch size for its next pull command. Once execution latency falls below `50ms`, the pull batch size expands back to the configured limit.
+*   **Benefit:** Natural backpressure feedback that prevents overload, mitigates head-of-line blocking, and ensures smooth runtime execution.
+
 ---
 
 ## 🏗️ System Architecture
 
-<p align="center">
-  <img src="architecture.png" alt="Tachyon Architecture" width="600" />
-</p>
+```mermaid
+graph TD
+    classDef producer fill:#0d1117,stroke:#58a6ff,stroke-width:2px,color:#c9d1d9;
+    classDef nats fill:#161b22,stroke:#ff7b72,stroke-width:2px,color:#c9d1d9;
+    classDef worker fill:#0d1117,stroke:#56d364,stroke-width:2px,color:#c9d1d9;
+    classDef metric fill:#161b22,stroke:#d2a8ff,stroke-width:2px,color:#c9d1d9;
+
+    P[Benchmark Producer]:::producer -->|Publish JSON jobs.high.* / jobs.low.*| N[NATS JetStream Stream: JOBS]:::nats
+    N -->|High-Priority Subject Filter| CH[Consumer: WORKER_HIGH]:::nats
+    N -->|Low-Priority Subject Filter| CL[Consumer: WORKER_LOW]:::nats
+
+    CH -->|1. Poll High Queue| W1[Worker Thread 1]:::worker
+    CH -->|1. Poll High Queue| W2[Worker Thread 2]:::worker
+    CH -->|1. Poll High Queue| W3[Worker Thread 3]:::worker
+    CH -->|1. Poll High Queue| W4[Worker Thread 4]:::worker
+
+    CL -.->|2. Fallback when High is Empty| W1
+    CL -.->|2. Fallback when High is Empty| W2
+    CL -.->|2. Fallback when High is Empty| W3
+    CL -.->|2. Fallback when High is Empty| W4
+
+    W1 -->|Increment| C[Atomic Job Counter]:::metric
+    W2 -->|Increment| C
+    W3 -->|Increment| C
+    W4 -->|Increment| C
+
+    M[HTTP Metrics Server /metrics]:::metric -.->|Exposes| C
+```
 
 ---
 
