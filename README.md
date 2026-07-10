@@ -72,7 +72,8 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 - [Job payload &amp; handler](#-job-payload--handler)
 - [Observability](#-observability)
 - [Resilience model](#-resilience-model)
-- [Use cases](#-use-cases)
+- [Real-World Use Case Patterns](#-real-world-use-case-patterns)
+- [Detailed Usage Examples](#-detailed-usage-examples)
 - [Production](#-production)
 - [Troubleshooting](#-troubleshooting)
 - [Project layout](#-project-layout)
@@ -485,38 +486,464 @@ Workers finish the in-flight job, stop pulling, and exit. Metrics server drains 
 
 ---
 
-## 💡 Use cases
+## 💡 Real-World Use Case Patterns
 
-Tachyon fits any **pull-based, durable, multi-worker** pipeline:
+Drop these handlers into `processJob` (or call them from it) after parsing your domain payload. Each example shows the job struct and processing sketch.
 
-| Domain | Pattern |
-| :--- | :--- |
-| **Transactional email** | High-priority password resets; low-priority digests |
-| **Fintech clearing** | Settlement jobs with strict retries + DLQ audit |
-| **Media pipelines** | Thumbnail / transcode workers with rate limits |
-| **Crawlers** | URL frontier on `jobs.low.*`, scrape on high for VIP hosts |
-| **Push notifications** | Device fan-out with circuit breaker around FCM/APNs |
-| **Log / telemetry** | Ingest bursts; auto-scale thread pool |
-
-Minimal producer sketch:
+### 1. Production Transactional Email Notification Dispatcher
+Reads user registration events and sends HTML transactional emails. Handles fallback options and records diagnostic statuses:
 
 ```zig
-const job = .{
-    .id = "evt_99012a",
-    .email = "billing@company.com",
-    .subject = "Invoice Settled",
-    .body = "Payment of $499.00 processed.",
+const std = @import("std");
+const NatsClient = @import("nats_client.zig").NatsClient;
+const Config = @import("nats_client.zig").Config;
+
+const EmailJob = struct {
+    to_address: []const u8,
+    template_id: []const u8,
+    variables: struct {
+        name: []const u8,
+        discount_code: ?[]const u8 = null,
+        expires_days: u32 = 7,
+    },
 };
-// serialize JSON, then:
-try client.publishWithHeaders(
-    "jobs.high.billing",
-    null,
-    &[_][]const u8{"Nats-Msg-Id: evt_99012a"},
-    payload,
-);
+
+pub fn processEmailJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Parse structured job configuration
+    const parsed = try std.json.parseFromSlice(EmailJob, alloc, payload, .{});
+    const job = parsed.value;
+
+    std.debug.print("[Email Service] Preparing SMTP dispatch for {s}...
+", .{job.to_address});
+    std.debug.print("[Email Service] Loading Template ID: {s} for customer: {s}
+", .{job.template_id, job.variables.name});
+    
+    if (job.variables.discount_code) |code| {
+        std.debug.print("[Email Service] Injecting promo code: {s} (Expires in {d} days)
+", .{code, job.variables.expires_days});
+    }
+
+    // (SMTP Connection and Transmission logic occurs here...)
+    std.debug.print("[Email Service] Email successfully sent to {s}.
+", .{job.to_address});
+}
+```
+
+### 2. High-Performance Image Transcoding & Thumbnail Pipeline
+Failsafe handler for generating image thumbnails concurrently. Parses files, resizes dimensions, and pushes results:
+
+```zig
+const ImageResizeJob = struct {
+    file_id: []const u8,
+    source_path: []const u8,
+    target_width: u32,
+    target_height: u32,
+    quality: u8 = 85,
+};
+
+pub fn processImageJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(ImageResizeJob, alloc, payload, .{});
+    const job = parsed.value;
+
+    std.debug.print("[Image Engine] Opening image file: {s}
+", .{job.source_path});
+    std.debug.print("[Image Engine] Resizing image {s} to dimensions: {d}x{d} (Quality: {d}%)
+", .{
+        job.file_id,
+        job.target_width,
+        job.target_height,
+        job.quality,
+    });
+
+    // (Actual decoding, resampling, and file writing operations occur here...)
+    std.debug.print("[Image Engine] File {s} written to storage successfully.
+", .{job.file_id});
+}
+```
+
+### 3. Log Analytics Ingestion & Alerting Worker
+Consumes clickstream logs, parses endpoint durations, and prints high-latency alarms:
+
+```zig
+const ClickstreamMetric = struct {
+    timestamp: i64,
+    service_name: []const u8,
+    endpoint: []const u8,
+    response_ms: u32,
+    status_code: u16,
+};
+
+pub fn processAnalyticsJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(ClickstreamMetric, alloc, payload, .{});
+    const metric = parsed.value;
+
+    if (metric.status_code >= 500) {
+        std.debug.print("[Analytics ALERT] Server Error 5xx detected on {s} at endpoint: {s}
+", .{metric.service_name, metric.endpoint});
+    }
+
+    if (metric.response_ms > 1500) {
+        std.debug.print("[Analytics WARNING] SLA Violated! Endpoint {s} responded in {d}ms
+", .{metric.endpoint, metric.response_ms});
+    }
+}
+```
+
+### 4. Distributed Web Scraping / Crawler Queue
+Parses link targets, executes async HTTP fetches, and extracts content metadata:
+
+```zig
+const CrawlJob = struct {
+    url: []const u8,
+    depth_limit: u8 = 3,
+    user_agent: []const u8 = "TachyonCrawler/1.0",
+    selectors: []const []const u8,
+};
+
+pub fn processCrawlJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(CrawlJob, alloc, payload, .{});
+    const job = parsed.value;
+
+    std.debug.print("[Web Crawler] Starting scrap job for URL: {s}
+", .{job.url});
+    std.debug.print("[Web Crawler] Applying selector query criteria count: {d}
+", .{job.selectors.len});
+    
+    // (Async HTTP fetch, HTML parsing, and database storage operations occur here...)
+    std.debug.print("[Web Crawler] Scrap job completed successfully for {s}.
+", .{job.url});
+}
+```
+
+### 5. Fintech Transaction Settlement Clearing Worker
+Clears pending ledger bank balances and records double-entry bookkeeping ledgers:
+
+```zig
+const SettlementJob = struct {
+    transaction_id: []const u8,
+    source_account: []const u8,
+    destination_account: []const u8,
+    amount_cents: u64,
+    currency: []const u8 = "USD",
+};
+
+pub fn processSettlementJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(SettlementJob, alloc, payload, .{});
+    const tx = parsed.value;
+
+    std.debug.print("[Fintech Core] Settling TX: {s}...
+", .{tx.transaction_id});
+    std.debug.print("[Fintech Core] Routing {s} {d}.{02d} from {s} to {s}
+", .{
+        tx.currency,
+        tx.amount_cents / 100,
+        tx.amount_cents % 100,
+        tx.source_account,
+        tx.destination_account,
+    });
+
+    // (Execute ACID balance checks, lock accounts, write ledger tables...)
+    std.debug.print("[Fintech Core] TX {s} cleared successfully.
+", .{tx.transaction_id});
+}
+```
+
+### 6. Mobile Device Real-Time Push Notification Engine
+Routes notifications to mobile notification gateways with device tokens and rate-limiting limits:
+
+```zig
+const PushNotificationJob = struct {
+    device_token: []const u8,
+    platform: enum { ios, android },
+    payload: struct {
+        alert_title: []const u8,
+        alert_body: []const u8,
+        badge_count: ?u32 = null,
+    },
+};
+
+pub fn processPushNotification(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(PushNotificationJob, alloc, payload, .{});
+    const note = parsed.value;
+
+    std.debug.print("[Push Engine] Dispatching alert to platform: {s}
+", .{@tagName(note.platform)});
+    std.debug.print("[Push Engine] Alert Title: {s}
+", .{note.payload.alert_title});
+
+    if (note.payload.badge_count) |badge| {
+        std.debug.print("[Push Engine] Setting badge count to: {d}
+", .{badge});
+    }
+
+    // (APNs/FCM HTTP2 connection dispatch and retry logic occurs here...)
+    std.debug.print("[Push Engine] Notification successfully pushed to token: {s}
+", .{note.device_token[0..8]});
+}
 ```
 
 ---
+
+## 💻 Detailed Usage Examples
+
+Complete, copy-adaptable programs for enqueuing work and running a multi-threaded consumer. These mirror the patterns in `src/producer.zig` and `src/worker.zig` (simplified for teaching).
+
+### 1. Standalone Production Producer (Enqueuer)
+This complete program demonstrates establishing connection configs, wrapping streams, serializing nested payload structures, and flushing commands synchronously:
+
+```zig
+const std = @import("std");
+const NatsClient = @import("nats_client.zig").NatsClient;
+const Config = @import("nats_client.zig").Config;
+
+const JobPayload = struct {
+    id: []const u8,
+    email: []const u8,
+    subject: []const u8,
+    body: []const u8,
+};
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    
+    // Setup clean General Purpose Allocator
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 1. Configure Connection Details
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 4222,
+        .username = null, // Set if authentication required
+        .password = null,
+        .use_tls = false, // Set to true for secure clusters
+        .ca_path = null,
+    };
+
+    std.debug.print("Connecting to NATS JetStream broker at {s}:{d}...
+", .{config.host, config.port});
+    var client = try NatsClient.connect(io, allocator, config);
+    defer client.deinit();
+    std.debug.print("Connected successfully!
+", .{});
+
+    // 2. Initialize Stream and Priority Consumer Groups
+    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" }, 0);
+    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*", 5);
+    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*", 5);
+    try client.flush(); // Flush socket to ensure NATS registers entities
+
+    // 3. Serialize structured JSON data
+    const job = JobPayload{
+        .id = "evt_99012a",
+        .email = "billing@company.com",
+        .subject = "Invoice Settled: #10922",
+        .body = "Thank you! Your payment of $499.00 has been processed successfully.",
+    };
+
+    var payload_list = std.ArrayList(u8).empty;
+    defer payload_list.deinit(allocator);
+    try payload_list.writer(allocator).print("{f}", .{std.json.fmt(job, .{})});
+
+    // 4. Publish to NATS JetStream High Priority Subject
+    std.debug.print("Publishing high priority payload: {s}
+", .{job.id});
+    try client.publish("jobs.high.billing", null, payload_list.items);
+    // Or with headers: try client.publishWithHeaders(..., &[_][]const u8{"Nats-Msg-Id: evt_99012a"}, payload);
+    try client.flush(); // Guarantee transmission
+    
+    std.debug.print("Enqueued job {s} successfully!
+", .{job.id});
+}
+```
+
+### 2. Multi-Threaded Concurrent Worker & Telemetry Manager
+This production-grade script illustrates the worker manager loop, thread-local connection instances, priority fallback routing, zero-allocation memory arena resets, and backpressure batch throttling:
+
+```zig
+const std = @import("std");
+const NatsClient = @import("nats_client.zig").NatsClient;
+const Config = @import("nats_client.zig").Config;
+
+const Job = struct {
+    id: []const u8,
+    email: []const u8,
+    subject: []const u8,
+    body: []const u8,
+};
+
+// Thread context structure
+const WorkerContext = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    thread_id: usize,
+    batch_size: usize,
+    config: Config,
+};
+
+// Global indicators for pool management
+var should_shutdown = std.atomic.Value(bool).init(false);
+var target_threads = std.atomic.Value(usize).init(4);
+var total_jobs = std.atomic.Value(usize).init(0);
+
+pub fn workerThreadRun(ctx: *WorkerContext) void {
+    defer ctx.allocator.destroy(ctx);
+    
+    var inbox_buf: [64]u8 = undefined;
+    const inbox = std.fmt.bufPrint(&inbox_buf, "inbox.worker_t{d}", .{ctx.thread_id}) catch return;
+
+    // Initialize local Arena Allocator outside the loop (prevents heap fragmentation)
+    var job_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer job_arena.deinit();
+    const job_alloc = job_arena.allocator();
+
+    var adaptive_batch = ctx.batch_size;
+    var backoff_ms: u32 = 1000;
+
+    while (!should_shutdown.load(.monotonic)) {
+        // Scale-down check: terminate thread if target pool count is reduced
+        if (ctx.thread_id > target_threads.load(.monotonic)) {
+            std.debug.print("[Thread {d}] Down-scaled. Terminating thread cleanly.
+", .{ctx.thread_id});
+            break;
+        }
+
+        // Establish connection with backoff retry
+        var client = NatsClient.connect(ctx.io, ctx.allocator, ctx.config) catch |err| {
+            std.debug.print("[Thread {d}] Connect error: {}. Retrying in {d}ms...
+", .{ctx.thread_id, err, backoff_ms});
+            ctx.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            backoff_ms = @min(backoff_ms * 2, 30000);
+            continue;
+        };
+        backoff_ms = 1000;
+        defer client.deinit();
+
+        client.subscribe(inbox, "1") catch continue;
+
+        while (!should_shutdown.load(.monotonic)) {
+            if (ctx.thread_id > target_threads.load(.monotonic)) break;
+
+            // 1. Priority Pull: Request from WORKER_HIGH
+            client.requestNext("JOBS", "WORKER_HIGH", inbox, adaptive_batch) catch break;
+
+            var msg_count: usize = 0;
+            var is_high_empty = false;
+            var batch_latency_sum: i64 = 0;
+            var processed_in_batch: usize = 0;
+
+            while (msg_count < adaptive_batch) : (msg_count += 1) {
+                var msg = client.readMsg() catch break;
+                defer msg.deinit();
+
+                // Empty queue or timeout status check
+                if (msg.payload.len == 0 or std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
+                    is_high_empty = true;
+                    break;
+                }
+
+                const start_t = std.Io.Timestamp.now(ctx.io, .awake);
+
+                // Parse payload inside reusable arena memory
+                const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
+                    std.debug.print("[Thread {d}] Corrupt payload. Routing to DLQ...
+", .{ctx.thread_id});
+                    client.publish("jobs.failed", null, msg.payload) catch {};
+                    client.ack(&msg) catch {};
+                    _ = job_arena.reset(.retain_capacity);
+                    continue;
+                };
+
+                // Execute business logic...
+                std.debug.print("Job {s} processed for {s}
+", .{parsed.value.id, parsed.value.email});
+
+                client.ack(&msg) catch break;
+                _ = total_jobs.fetchAdd(1, .monotonic);
+
+                // Latency tracking
+                const end_t = std.Io.Timestamp.now(ctx.io, .awake);
+                batch_latency_sum += start_t.durationTo(end_t).toMilliseconds();
+                processed_in_batch += 1;
+
+                // Reset arena but retain capacity (Zero heap allocations!)
+                _ = job_arena.reset(.retain_capacity);
+            }
+
+            // 2. Fallback Pull: Poll WORKER_LOW if high priority returned empty
+            if (is_high_empty and !should_shutdown.load(.monotonic)) {
+                client.requestNext("JOBS", "WORKER_LOW", inbox, adaptive_batch) catch break;
+                msg_count = 0;
+                while (msg_count < adaptive_batch) : (msg_count += 1) {
+                    var msg = client.readMsg() catch break;
+                    defer msg.deinit();
+
+                    if (msg.payload.len == 0 or std.mem.startsWith(u8, msg.payload, "NATS/1.0")) break;
+
+                    const start_t = std.Io.Timestamp.now(ctx.io, .awake);
+                    const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
+                        client.publish("jobs.failed", null, msg.payload) catch {};
+                        client.ack(&msg) catch {};
+                        _ = job_arena.reset(.retain_capacity);
+                        continue;
+                    };
+
+                    std.debug.print("Low-Priority Job {s} processed.
+", .{parsed.value.id});
+                    client.ack(&msg) catch break;
+                    _ = total_jobs.fetchAdd(1, .monotonic);
+
+                    batch_latency_sum += start_t.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
+                    processed_in_batch += 1;
+                    _ = job_arena.reset(.retain_capacity);
+                }
+            }
+
+            // 3. Adaptive Batching Backpressure Control
+            if (processed_in_batch > 0) {
+                const avg_lat = @divFloor(batch_latency_sum, @as(i64, @intCast(processed_in_batch)));
+                if (avg_lat > 200) {
+                    // Backpressure throttle batch size
+                    adaptive_batch = @max(adaptive_batch / 2, 1);
+                } else if (avg_lat < 50) {
+                    // Recover batch size
+                    adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+---
+
 
 ## 🏭 Production
 
