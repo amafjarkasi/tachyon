@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 - Modular source layout: split `worker.zig` into `config`, `resilience`, `job`, `metrics_server`, and `logging` modules
+- Brand assets moved to `assets/` (logos, architecture diagram, logo options)
+- README: real end-to-end usage recipes (hello world, benchmark, Docker, DLQ, custom handler, shutdown)
+
+### Added
+- Expanded `.gitignore` (OS junk, env files, coverage artifacts)
 
 ---
 

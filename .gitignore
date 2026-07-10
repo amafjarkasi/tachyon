@@ -7,11 +7,21 @@ zig-out/
 *.pdb
 *.o
 *.obj
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
 
-# Local configuration files
+# Local configuration (keep config.json.example tracked)
 config.json
 
-# IDE settings
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
 .idea/
 .vscode/
 *.suo
@@ -19,3 +29,16 @@ config.json
 *.njsproj
 *.sln
 *.swp
+*.swo
+*~
+
+# Local notes / scratch
+*.local
+.env
+.env.*
+!.env.example
+
+# Test / coverage artifacts (if added later)
+coverage/
+*.profraw
+*.profdata

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="720" />
+  <img src="assets/logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="720" />
 </p>
 
 <p align="center">
@@ -64,6 +64,7 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 - [Why teams pick Tachyon](#why-teams-pick-tachyon)
 - [What you get out of the box](#what-you-get-out-of-the-box)
 - [Quick Start](#-quick-start)
+- [Real usage recipes](#-real-usage-recipes)
 - [Features](#-features)
 - [Architecture](#️-architecture)
 - [Performance](#-performance)
@@ -168,6 +169,146 @@ zig_jobs_processed_total 50000
 # TYPE zig_jobs_failed_total counter
 zig_jobs_failed_total 0
 ```
+
+### Expected worker log shape
+
+```json
+{"level":"info","message":"Successfully loaded configuration from config.json"}
+{"level":"info","message":"Initializing NATS JetStream Stream & Consumers..."}
+{"level":"info","message":"Metrics Server listening on http://127.0.0.1:8080 (/metrics, /health)"}
+{"level":"info","message":"Spawning worker threads..."}
+{"level":"info","thread_id":1,"message":"Processing job id=job_12345 to=hello@example.com subject=Welcome to Antigravity!"}
+{"level":"info","message":"Throughput: 1 jobs/sec | Avg: 1.00 | Active: 4 | Failed: 0"}
+```
+
+---
+
+## 📘 Real usage recipes
+
+These are **runnable** workflows against a live `nats-server -js`. They use the shipped binaries — no extra code required.
+
+### Recipe A — Hello world (single job)
+
+```bash
+# terminal 1
+nats-server -js
+
+# terminal 2
+zig build -Doptimize=ReleaseFast
+zig build run-worker -Doptimize=ReleaseFast -- --threads 2 --batch 10
+
+# terminal 3
+zig build run-producer -Doptimize=ReleaseFast
+curl -s http://127.0.0.1:8080/metrics | grep zig_jobs_processed_total
+# expect: zig_jobs_processed_total 1
+```
+
+What happens:
+
+1. Worker creates stream `JOBS` + consumers `WORKER_HIGH` / `WORKER_LOW` + DLQ stream `DEAD_LETTERS`.  
+2. Producer HPUB-publishes one JSON job to `jobs.high.email` with `Nats-Msg-Id`.  
+3. A worker thread pulls, parses, runs `processJob` in `src/job.zig`, then `+ACK`s.  
+4. Metrics counter increments; structured JSON logs show the job id.
+
+### Recipe B — Throughput smoke test
+
+```bash
+zig build run-worker -Doptimize=ReleaseFast -- --threads 4 --batch 100
+zig build run-benchmark-producer -Doptimize=ReleaseFast -- --jobs 100000
+```
+
+Watch the worker print:
+
+```text
+Throughput: NNNNN jobs/sec | Avg: … | Active: 4 | Failed: 0
+```
+
+Tips:
+
+- Auto-scale kicks in above **~30k jobs/sec** (spawns up to 8 threads).  
+- 80% of benchmark jobs go to `jobs.high.*`, 20% to `jobs.low.*`.  
+- For max numbers use `ReleaseFast` and a quiet machine.
+
+### Recipe C — Config + env overrides (staging-like)
+
+```bash
+cp config.json.example config.json
+# edit config.json: worker_threads, stream_name, max_deliver, job_timeout_ms, …
+
+export NATS_HOST=127.0.0.1
+export NATS_PORT=4222
+export MAX_DELIVER=8
+export JOB_TIMEOUT_MS=3000
+export MAX_JOBS_PER_SECOND=500   # optional throttle
+
+zig build run-worker -Doptimize=ReleaseFast -- --threads 6 --batch 50
+```
+
+Precedence: **CLI > env > config.json > defaults**.
+
+### Recipe D — Docker worker
+
+```bash
+docker build -t tachyon:0.2.0 .
+docker run --rm --network host \
+  -e NATS_HOST=127.0.0.1 \
+  -e NATS_PORT=4222 \
+  -p 8080:8080 \
+  tachyon:0.2.0
+```
+
+Then produce from the host:
+
+```bash
+zig build run-producer -Doptimize=ReleaseFast
+curl -s http://127.0.0.1:8080/health   # ok
+```
+
+### Recipe E — Inspect the DLQ after a poison message
+
+Publish invalid JSON (not a Tachyon Job object) so the worker routes it to the DLQ:
+
+```bash
+# requires NATS CLI: https://github.com/nats-io/natscli
+nats pub jobs.high.email '{"not":"a-valid-job"}'
+
+# worker logs: Job parsing failed. Routing to DLQ.
+nats stream ls
+nats stream view DEAD_LETTERS
+# or: nats sub jobs.failed
+```
+
+Poison messages are **`+TERM`**ed (not retried). Handler failures with valid JSON use **`-NAK` + backoff** until `max_deliver`, then DLQ + TERM.
+
+### Recipe F — Custom domain handler
+
+1. Edit [`src/job.zig`](src/job.zig) — replace the body of `processJob` with your SMTP / HTTP / DB call.  
+2. Rebuild: `zig build -Doptimize=ReleaseFast`  
+3. Keep the default JSON shape (`id`, `email`, `subject`, `body`) **or** change both the producer payload and the `Job` struct together.  
+4. Return `error.Timeout` or any error to exercise NAK retry; invalid JSON still goes straight to DLQ.
+
+```zig
+// src/job.zig — minimal real-ish handler sketch
+pub fn processJob(job: Job, thread_id: usize, timeout_ms: u32, io: std.Io, progress: ?*const fn () void) !void {
+    _ = timeout_ms;
+    _ = progress;
+    // e.g. call your mailer / HTTP client here
+    logging.logJSON("info", thread_id, job.id);
+    // try sendEmail(io, job.email, job.subject, job.body);
+}
+```
+
+### Recipe G — Graceful shutdown
+
+```bash
+# Linux / macOS
+kill -TERM $(pgrep -f 'zig-out/bin/worker')
+
+# Windows
+# Ctrl+C in the worker console
+```
+
+Workers finish the in-flight job, stop pulling, and exit. Metrics server drains with them. Prefer `SIGTERM` over `SIGKILL` so JetStream does not redeliver mid-ACK races unnecessarily.
 
 ---
 
@@ -1019,25 +1160,22 @@ nats stream view DEAD_LETTERS
 
 ```text
 tachyon/
-├── src/
+├── src/                        # Zig sources (modules + binaries)
 │   ├── worker.zig              # main: pool, pull loop, auto-scale, signals
-│   ├── nats_client.zig         # raw NATS/JetStream TCP+TLS client (HMSG, ACK/NAK)
-│   ├── config.zig              # AppConfig + JSON / env / CLI loading
-│   ├── resilience.zig          # backoff, jitter, rate limit, circuit breaker, dedup
-│   ├── job.zig                 # Job payload + processJob domain handler
-│   ├── metrics_server.zig      # HTTP /health + /metrics
-│   ├── logging.zig             # structured JSON logger
-│   ├── producer.zig            # single-job HPUB enqueuer
-│   ├── benchmark_producer.zig  # load generator
-│   └── tests.zig               # unit tests (zig build test)
+│   ├── nats_client.zig         # raw NATS/JetStream TCP+TLS client
+│   ├── config.zig / job.zig / resilience.zig / metrics_server.zig / logging.zig
+│   ├── producer.zig / benchmark_producer.zig
+│   └── tests.zig
+├── assets/                     # logos, architecture diagram, logo options
+│   ├── logo.png / logo-banner.png
+│   └── logo-options/
+├── docs/superpowers/           # design plans (agent/internal)
+├── .github/workflows/ci.yml
 ├── config.json.example
 ├── build.zig / build.zig.zon
 ├── Dockerfile
-├── logo.png / logo-banner.png  # brand assets
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-└── LICENSE
+├── CHANGELOG.md / CONTRIBUTING.md / SECURITY.md / LICENSE
+└── README.md
 ```
 
 | Module | Responsibility |
@@ -1080,6 +1218,6 @@ Latest release: **[v0.2.0](https://github.com/amafjarkasi/tachyon/releases/tag/v
 ---
 
 <p align="center">
-  <img src="logo.png" alt="Tachyon" width="96" /><br/>
+  <img src="assets/logo.png" alt="Tachyon" width="96" /><br/>
   <sub>Built with Zig · Powered by NATS JetStream · Designed for production speed</sub>
 </p>
