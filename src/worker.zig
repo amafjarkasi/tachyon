@@ -224,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
             const elapsed = @as(f64, @floatFromInt(elapsed_duration.toMilliseconds())) / 1000.0;
             const avg_rate = @as(f64, @floatFromInt(current_count)) / elapsed;
             const active_count = target_threads.load(.monotonic);
-            
+
             // Format log message
             var log_msg_buf: [128]u8 = undefined;
             const log_msg = std.fmt.bufPrint(&log_msg_buf, "Throughput: {d} jobs/sec | Avg: {d:.2} jobs/sec | Active: {d}", .{ diff, avg_rate, active_count }) catch continue;
@@ -235,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
                 const new_id = active_count + 1;
                 logJSON("info", null, "High throughput detected. Scaling worker pool UP.");
                 _ = target_threads.fetchAdd(1, .monotonic);
-                
+
                 const ctx = try allocator.create(WorkerContext);
                 ctx.* = .{
                     .io = io,
@@ -261,7 +261,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn workerRun(ctx: *WorkerContext) void {
     defer ctx.allocator.destroy(ctx);
-    
+
     // Construct local inbox for this thread
     var inbox_buf: [32]u8 = undefined;
     const inbox = std.fmt.bufPrint(&inbox_buf, "inbox.worker_t{d}", .{ctx.thread_id}) catch return;
@@ -505,10 +505,7 @@ fn metricsServerRun(ctx: *MetricsContext) void {
 
         var write_buf: [512]u8 = undefined;
         var w = conn.writer(ctx.io, &write_buf);
-        w.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ body.len, body }
-        ) catch continue;
+        w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
         w.interface.flush() catch continue;
     }
     logJSON("info", null, "Metrics Server exited cleanly.");

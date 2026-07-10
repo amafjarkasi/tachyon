@@ -240,7 +240,7 @@ pub const NatsClient = struct {
                 _ = it.next(); // Skip "MSG"
                 const subject = try alloc.dupe(u8, it.next() orelse return error.InvalidMsgFormat);
                 const sid = try alloc.dupe(u8, it.next() orelse return error.InvalidMsgFormat);
-                
+
                 const token3 = it.next() orelse return error.InvalidMsgFormat;
                 var reply_to: ?[]const u8 = null;
                 var size_str: []const u8 = undefined;
@@ -285,7 +285,7 @@ pub const NatsClient = struct {
 
         var subjects_buf = std.ArrayList(u8).empty;
         defer subjects_buf.deinit(self.allocator);
-        
+
         for (subjects, 0..) |subj, i| {
             if (i > 0) try subjects_buf.appendSlice(self.allocator, ",");
             try subjects_buf.appendSlice(self.allocator, "\"");
@@ -333,7 +333,7 @@ pub const NatsClient = struct {
         const w = self.getWriter();
         try w.writeAll("PING\r\n");
         try w.flush();
-        
+
         while (true) {
             const line = try self.readLine() orelse return error.ConnectionClosed;
             if (std.mem.startsWith(u8, line, "PONG")) {
