@@ -533,8 +533,9 @@ Copy [`config.json.example`](config.json.example):
     "pull_expires_empty_ns": 50000000,
     "bench_skip_json": false,
     "empty_poll_sleep_ms": 1,
-    "ack_flush_every": 64,
-    "pull_prefetch": true
+    "ack_flush_every": 128,
+    "pull_prefetch": true,
+    "single_consumer_mode": false
 }
 ```
 
