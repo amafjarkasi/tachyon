@@ -47,8 +47,11 @@ const WorkerContext = struct {
     circuit_open_ms: u32,
     batch_ack: bool,
     pull_expires_ns: u64,
+    pull_expires_empty_ns: u64,
     bench_skip_json: bool,
     empty_poll_sleep_ms: u32,
+    ack_flush_every: u32,
+    pull_prefetch: bool,
 };
 
 const CTRL_C_EVENT = 0;
@@ -212,8 +215,11 @@ fn makeWorkerContext(allocator: std.mem.Allocator, io: std.Io, thread_id: usize,
         .circuit_open_ms = app_config.circuit_open_ms,
         .batch_ack = app_config.batch_ack,
         .pull_expires_ns = app_config.pull_expires_ns,
+        .pull_expires_empty_ns = app_config.pull_expires_empty_ns,
         .bench_skip_json = app_config.bench_skip_json,
         .empty_poll_sleep_ms = app_config.empty_poll_sleep_ms,
+        .ack_flush_every = app_config.ack_flush_every,
+        .pull_prefetch = app_config.pull_prefetch,
     };
     return ctx;
 }
@@ -222,6 +228,13 @@ const JobOutcome = enum {
     continue_batch,
     break_batch,
 };
+
+fn maybeFlushAcks(client: *NatsClient, ctx: *WorkerContext, pending_acks: *u32, force: bool) void {
+    if (pending_acks.* == 0) return;
+    if (!force and ctx.ack_flush_every > 0 and pending_acks.* < ctx.ack_flush_every) return;
+    client.flushWrites() catch {};
+    pending_acks.* = 0;
+}
 
 fn handleJob(
     client: *NatsClient,
@@ -233,7 +246,7 @@ fn handleJob(
     processed_in_batch: *usize,
     dedup: *DedupCache,
     circuit: *CircuitBreaker,
-    defer_flush: *bool,
+    pending_acks: *u32,
 ) JobOutcome {
     // Skip wall-clock work when timeouts are disabled (pure throughput path).
     const track_time = ctx.job_timeout_ms > 0;
@@ -255,7 +268,8 @@ fn handleJob(
     if (ctx.bench_skip_json) {
         if (ctx.batch_ack) {
             client.ackBuffered(msg) catch return .break_batch;
-            defer_flush.* = true;
+            pending_acks.* += 1;
+            maybeFlushAcks(client, ctx, pending_acks, false);
         } else {
             client.ack(msg) catch return .break_batch;
         }
@@ -285,7 +299,8 @@ fn handleJob(
     if (dedup.enabled() and dedup.contains(job.id)) {
         if (ctx.batch_ack) {
             client.ackBuffered(msg) catch return .break_batch;
-            defer_flush.* = true;
+            pending_acks.* += 1;
+            maybeFlushAcks(client, ctx, pending_acks, false);
         } else {
             client.ack(msg) catch return .break_batch;
         }
@@ -344,7 +359,8 @@ fn handleJob(
 
     if (ctx.batch_ack) {
         client.ackBuffered(msg) catch return .break_batch;
-        defer_flush.* = true;
+        pending_acks.* += 1;
+        maybeFlushAcks(client, ctx, pending_acks, false);
     } else {
         client.ack(msg) catch return .break_batch;
     }
@@ -368,21 +384,33 @@ fn pullConsumerBatch(
     consumer: []const u8,
     inbox: []const u8,
     adaptive_batch: usize,
+    expires_ns: u64,
     job_alloc: std.mem.Allocator,
     job_arena: *std.heap.ArenaAllocator,
     latency_sum: *i64,
     processed_in_batch: *usize,
     dedup: *DedupCache,
     circuit: *CircuitBreaker,
+    pending_acks: *u32,
+    /// When true, a requestNext was already issued (prefetch).
+    already_requested: bool,
 ) enum { empty, ok, reconnect } {
-    client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch, ctx.pull_expires_ns) catch return .reconnect;
+    if (!already_requested) {
+        client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch, expires_ns) catch return .reconnect;
+    }
 
     var msg_count: usize = 0;
     var saw_empty = false;
-    var need_flush = false;
     var got_work = false;
+    var prefetched = false;
 
     while (msg_count < adaptive_batch) : (msg_count += 1) {
+        // Prefetch next batch once we've consumed half — overlaps NATS RTT with processing.
+        if (ctx.pull_prefetch and !prefetched and !saw_empty and got_work and msg_count >= adaptive_batch / 2) {
+            client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch, ctx.pull_expires_ns) catch {};
+            prefetched = true;
+        }
+
         var msg = client.readMsg() catch return .reconnect;
         defer msg.deinit();
 
@@ -396,21 +424,14 @@ fn pullConsumerBatch(
         }
 
         got_work = true;
-        const outcome = handleJob(client, ctx, &msg, job_alloc, job_arena, latency_sum, processed_in_batch, dedup, circuit, &need_flush);
+        const outcome = handleJob(client, ctx, &msg, job_alloc, job_arena, latency_sum, processed_in_batch, dedup, circuit, pending_acks);
         if (outcome == .break_batch) return .reconnect;
     }
 
-    if (need_flush) {
-        client.flushWrites() catch {};
-    }
-
-    // Full batch with no status = healthy load; grow adaptive batch even without latency samples.
-    if (got_work and !saw_empty and msg_count >= adaptive_batch) {
-        // signal via latency_sum sentinel: caller uses processed_in_batch
-    }
+    // Always flush remaining ACKs at end of pull batch.
+    maybeFlushAcks(client, ctx, pending_acks, true);
 
     if (saw_empty and !got_work) return .empty;
-    if (saw_empty and msg_count <= 1 and !got_work) return .empty;
     return .ok;
 }
 
@@ -426,7 +447,10 @@ fn workerRun(ctx: *WorkerContext) void {
     defer job_arena.deinit();
     const job_alloc = job_arena.allocator();
 
-    var dedup = DedupCache.init(ctx.allocator, ctx.dedup_cache_size);
+    var dedup = DedupCache.init(ctx.allocator, ctx.dedup_cache_size) catch {
+        logging.logJSON("error", ctx.thread_id, "Dedup cache alloc failed.");
+        return;
+    };
     defer dedup.deinit();
 
     var circuit = CircuitBreaker{
@@ -436,6 +460,7 @@ fn workerRun(ctx: *WorkerContext) void {
 
     var adaptive_batch = ctx.batch_size;
     var empty_streak: u32 = 0;
+    var pending_acks: u32 = 0;
 
     while (!should_shutdown.load(.monotonic)) {
         if (ctx.thread_id > target_threads.load(.monotonic)) {
@@ -470,16 +495,20 @@ fn workerRun(ctx: *WorkerContext) void {
             var latency_sum: i64 = 0;
             var processed_in_batch: usize = 0;
 
-            const high = pullConsumerBatch(&client, ctx, ctx.consumer_high, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
+            // Adaptive expires: long when busy, short when empty.
+            const expires = if (empty_streak == 0) ctx.pull_expires_ns else ctx.pull_expires_empty_ns;
+
+            const high = pullConsumerBatch(&client, ctx, ctx.consumer_high, inbox, adaptive_batch, expires, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit, &pending_acks, false);
             if (high == .reconnect) break;
 
             var both_empty = high == .empty;
             if (high == .empty and !should_shutdown.load(.monotonic)) {
                 if (ctx.thread_id > target_threads.load(.monotonic)) break;
-                // Don't probe low every single empty high when streak is high (saves RTT).
+                // Probe low less often when dry (saves RTT).
                 const probe_low = empty_streak < 2 or (empty_streak % 4 == 0);
                 if (probe_low) {
-                    const low = pullConsumerBatch(&client, ctx, ctx.consumer_low, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
+                    const low_exp = ctx.pull_expires_empty_ns;
+                    const low = pullConsumerBatch(&client, ctx, ctx.consumer_low, inbox, adaptive_batch, low_exp, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit, &pending_acks, false);
                     if (low == .reconnect) break;
                     both_empty = low == .empty;
                 }
@@ -489,7 +518,6 @@ fn workerRun(ctx: *WorkerContext) void {
 
             if (processed_in_batch > 0) {
                 empty_streak = 0;
-                // Grow batch when we're filling it (works even without latency samples).
                 if (processed_in_batch >= adaptive_batch) {
                     adaptive_batch = @min(adaptive_batch + 25, ctx.batch_size);
                 } else if (latency_sum > 0) {
@@ -503,7 +531,6 @@ fn workerRun(ctx: *WorkerContext) void {
             } else if (both_empty) {
                 empty_streak += 1;
                 if (ctx.empty_poll_sleep_ms > 0) {
-                    // Back off empty polling so we don't burn CPU/NATS on dry queues.
                     const sleep_ms: u32 = @min(ctx.empty_poll_sleep_ms * @min(empty_streak, 10), 50);
                     ctx.io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
                 }

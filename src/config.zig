@@ -28,12 +28,18 @@ pub const AppConfig = struct {
     circuit_failure_threshold: u32 = 10,
     circuit_open_ms: u32 = 5000,
     batch_ack: bool = true,
-    /// JetStream pull expires in nanoseconds (default 250ms). Lower = snappier empty polls.
-    pull_expires_ns: u64 = 250_000_000,
+    /// JetStream pull expires in nanoseconds when busy (default 1s — fewer empty RTs under load).
+    pull_expires_ns: u64 = 1_000_000_000,
+    /// Pull expires when queues look empty (default 50ms — snappy idle).
+    pull_expires_empty_ns: u64 = 50_000_000,
     /// When true, skip JSON parse and treat payload as opaque (throughput microbench).
     bench_skip_json: bool = false,
     /// Idle sleep after both high/low queues return empty (ms). 0 = busy spin.
     empty_poll_sleep_ms: u32 = 1,
+    /// Flush buffered +ACKs every N acks (0 = flush only at end of pull batch).
+    ack_flush_every: u32 = 64,
+    /// Issue next requestNext before finishing current batch (prefetch).
+    pull_prefetch: bool = true,
 };
 
 pub const LoadedConfig = struct {
@@ -98,6 +104,9 @@ pub fn applyEnv(app: *AppConfig, nats: *NatsConfig, environ: anytype) !void {
     if (environ.get("PULL_EXPIRES_NS")) |val| {
         app.pull_expires_ns = try std.fmt.parseInt(u64, val, 10);
     }
+    if (environ.get("PULL_EXPIRES_EMPTY_NS")) |val| {
+        app.pull_expires_empty_ns = try std.fmt.parseInt(u64, val, 10);
+    }
     if (environ.get("BENCH_SKIP_JSON")) |val| {
         app.bench_skip_json = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
     }
@@ -106,6 +115,12 @@ pub fn applyEnv(app: *AppConfig, nats: *NatsConfig, environ: anytype) !void {
     }
     if (environ.get("DEDUP_CACHE_SIZE")) |val| {
         app.dedup_cache_size = try std.fmt.parseInt(usize, val, 10);
+    }
+    if (environ.get("ACK_FLUSH_EVERY")) |val| {
+        app.ack_flush_every = try std.fmt.parseInt(u32, val, 10);
+    }
+    if (environ.get("PULL_PREFETCH")) |val| {
+        app.pull_prefetch = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
     }
 }
 

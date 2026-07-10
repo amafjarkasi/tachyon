@@ -457,11 +457,24 @@ test "timeout: exceeds limit" {
 }
 
 test "dedup: second insert is duplicate" {
-    var cache = resilience.DedupCache.init(std.testing.allocator, 100);
+    var cache = try resilience.DedupCache.init(std.testing.allocator, 100);
     defer cache.deinit();
     cache.remember("job_1");
     try std.testing.expect(cache.contains("job_1"));
     try std.testing.expect(!cache.contains("job_2"));
+}
+
+test "dedup: disabled when max_size is 0" {
+    var cache = try resilience.DedupCache.init(std.testing.allocator, 0);
+    defer cache.deinit();
+    try std.testing.expect(!cache.enabled());
+    cache.remember("job_1");
+    try std.testing.expect(!cache.contains("job_1"));
+}
+
+test "hashId: stable for same input" {
+    try std.testing.expectEqual(resilience.hashId("abc"), resilience.hashId("abc"));
+    try std.testing.expect(resilience.hashId("abc") != resilience.hashId("abd"));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -49,7 +49,6 @@ pub const CircuitBreaker = struct {
     }
 
     pub fn onSuccess(self: *CircuitBreaker) void {
-        // Hot path: skip work when already healthy
         if (self.state == .closed and self.consecutive_failures == 0) return;
         self.consecutive_failures = 0;
         self.state = .closed;
@@ -67,50 +66,96 @@ pub const CircuitBreaker = struct {
     }
 };
 
-/// Bounded job-id dedup cache. Keys are owned by the map (allocator-backed).
-/// `max_size == 0` disables dedup entirely (fast path for pure throughput benches).
-/// When full, new ids are not inserted (no free-all eviction storm).
+/// FNV-1a 64-bit hash for job ids (no allocation).
+pub fn hashId(id: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (id) |c| {
+        h ^= c;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+/// Bounded job-id dedup via open-addressed hash set of u64 hashes.
+/// `max_size == 0` disables dedup. When full, oldest slots are overwritten (ring-like).
+/// False positives possible (hash collision) — acceptable for soft idempotency.
 pub const DedupCache = struct {
-    map: std.StringHashMap(void),
+    slots: []u64,
+    /// 0 = empty slot sentinel (ids hashing to 0 use 1).
+    len: usize = 0,
+    insert_cursor: usize = 0,
     allocator: std.mem.Allocator,
     max_size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, max_size: usize) DedupCache {
+    pub fn init(allocator: std.mem.Allocator, max_size: usize) !DedupCache {
+        if (max_size == 0) {
+            return .{
+                .slots = &[_]u64{},
+                .allocator = allocator,
+                .max_size = 0,
+            };
+        }
+        // Power-of-two capacity for fast mask; at least max_size*2 for load factor.
+        var cap: usize = 16;
+        while (cap < max_size * 2) : (cap *= 2) {}
+        const slots = try allocator.alloc(u64, cap);
+        @memset(slots, 0);
         return .{
-            .map = std.StringHashMap(void).init(allocator),
+            .slots = slots,
             .allocator = allocator,
             .max_size = max_size,
         };
     }
 
     pub fn deinit(self: *DedupCache) void {
-        var it = self.map.keyIterator();
-        while (it.next()) |k| {
-            self.allocator.free(k.*);
+        if (self.slots.len > 0) {
+            self.allocator.free(self.slots);
+            self.slots = &[_]u64{};
         }
-        self.map.deinit();
     }
 
     pub fn enabled(self: *const DedupCache) bool {
-        return self.max_size > 0;
+        return self.max_size > 0 and self.slots.len > 0;
+    }
+
+    fn norm(h: u64) u64 {
+        return if (h == 0) 1 else h;
     }
 
     pub fn contains(self: *const DedupCache, id: []const u8) bool {
-        if (self.max_size == 0) return false;
-        return self.map.contains(id);
+        if (!self.enabled()) return false;
+        const h = norm(hashId(id));
+        const mask = self.slots.len - 1;
+        var i: usize = @intCast(h & mask);
+        var probes: usize = 0;
+        while (probes < self.slots.len) : (probes += 1) {
+            const v = self.slots[i];
+            if (v == 0) return false;
+            if (v == h) return true;
+            i = (i + 1) & mask;
+        }
+        return false;
     }
 
     pub fn remember(self: *DedupCache, id: []const u8) void {
-        if (self.max_size == 0) return;
-        if (self.map.count() >= self.max_size) {
-            // Do not clear the whole map (O(n) free storm). Stop tracking new ids.
-            return;
+        if (!self.enabled()) return;
+        const h = norm(hashId(id));
+        const mask = self.slots.len - 1;
+        var i: usize = @intCast(h & mask);
+        var probes: usize = 0;
+        while (probes < self.slots.len) : (probes += 1) {
+            const v = self.slots[i];
+            if (v == 0) {
+                self.slots[i] = h;
+                self.len += 1;
+                return;
+            }
+            if (v == h) return; // already present
+            i = (i + 1) & mask;
         }
-        if (self.map.contains(id)) return;
-        if (self.allocator.dupe(u8, id)) |id_copy| {
-            self.map.put(id_copy, {}) catch {
-                self.allocator.free(id_copy);
-            };
-        } else |_| {}
+        // Table full of tombstones/values: overwrite ring cursor slot.
+        const idx = self.insert_cursor & mask;
+        self.slots[idx] = h;
+        self.insert_cursor +%= 1;
     }
 };

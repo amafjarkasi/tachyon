@@ -527,9 +527,12 @@ Copy [`config.json.example`](config.json.example):
     "circuit_failure_threshold": 10,
     "circuit_open_ms": 5000,
     "batch_ack": true,
-    "pull_expires_ns": 250000000,
+    "pull_expires_ns": 1000000000,
+    "pull_expires_empty_ns": 50000000,
     "bench_skip_json": false,
-    "empty_poll_sleep_ms": 1
+    "empty_poll_sleep_ms": 1,
+    "ack_flush_every": 64,
+    "pull_prefetch": true
 }
 ```
 
@@ -555,8 +558,11 @@ Copy [`config.json.example`](config.json.example):
 | `circuit_failure_threshold` | `10` | Failures before open |
 | `circuit_open_ms` | `5000` | Open duration |
 | `batch_ack` | `true` | Buffer ACKs; flush once per batch |
-| `pull_expires_ns` | `250000000` | JetStream pull wait (250ms). Lower = snappier empty polls |
+| `pull_expires_ns` | `1000000000` | JetStream pull wait when busy (1s) |
+| `pull_expires_empty_ns` | `50000000` | Pull wait when queues look empty (50ms) |
 | `empty_poll_sleep_ms` | `1` | Sleep after both queues empty (`0` = busy spin) |
+| `ack_flush_every` | `64` | Flush buffered `+ACK`s every N acks (`0` = end of batch only) |
+| `pull_prefetch` | `true` | Issue next `requestNext` mid-batch (overlap RTT) |
 | `bench_skip_json` | `false` | Skip JSON parse + `processJob` (microbench only) |
 
 ### Environment overrides
@@ -567,7 +573,8 @@ Copy [`config.json.example`](config.json.example):
 | `STREAM_NAME` `CONSUMER_HIGH` `CONSUMER_LOW` | Stream / consumers |
 | `SUBJECT_HIGH` `SUBJECT_LOW` `DLQ_SUBJECT` `DLQ_STREAM` | Subjects |
 | `MAX_DELIVER` `JOB_TTL_SECONDS` `MAX_JOBS_PER_SECOND` `JOB_TIMEOUT_MS` | Runtime limits |
-| `DEDUP_CACHE_SIZE` `PULL_EXPIRES_NS` `EMPTY_POLL_SLEEP_MS` `BENCH_SKIP_JSON` | Perf / bench knobs |
+| `DEDUP_CACHE_SIZE` `PULL_EXPIRES_NS` `PULL_EXPIRES_EMPTY_NS` `EMPTY_POLL_SLEEP_MS` | Pull / dedup |
+| `ACK_FLUSH_EVERY` `PULL_PREFETCH` `BENCH_SKIP_JSON` | ACK batching / prefetch / microbench |
 
 ```bash
 NATS_HOST=nats.prod.internal NATS_TLS=true \

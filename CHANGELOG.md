@@ -22,7 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - `benchmark-producer-mt` multi-connection load generator (`--publishers N`)
 
 ### Performance
-- Hot path: no per-job `+WPI`, optional skip JSON, stack `requestNext`, smarter dedup full policy
+- Hot path: no per-job `+WPI`, optional skip JSON, stack `requestNext`
+- ACK flush batching (`ack_flush_every`) — flush every N buffered `+ACK`s, not only end-of-batch
+- Pull prefetch (`pull_prefetch`) — next `requestNext` issued mid-batch to overlap NATS RTT
+- Adaptive pull expires — long when busy (`pull_expires_ns`), short when empty (`pull_expires_empty_ns`)
+- Dedup: open-addressed u64 hash set (no per-id string alloc); overwrite when full; `0` disables
 - Bench: unique job ids; quiet `processJob`; full 150k drain in ~2–3s on local loopback
 
 ---

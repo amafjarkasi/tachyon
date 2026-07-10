@@ -24,7 +24,10 @@
     "circuit_failure_threshold": 10,
     "circuit_open_ms": 5000,
     "batch_ack": true,
-    "pull_expires_ns": 250000000,
+    "pull_expires_ns": 1000000000,
+    "pull_expires_empty_ns": 50000000,
     "bench_skip_json": false,
-    "empty_poll_sleep_ms": 1
+    "empty_poll_sleep_ms": 1,
+    "ack_flush_every": 64,
+    "pull_prefetch": true
 }
