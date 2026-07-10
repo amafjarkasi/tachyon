@@ -63,26 +63,15 @@ graph TD
     classDef worker fill:#0d1117,stroke:#56d364,stroke-width:2px,color:#c9d1d9;
     classDef metric fill:#161b22,stroke:#d2a8ff,stroke-width:2px,color:#c9d1d9;
 
-    P[Benchmark Producer]:::producer -->|Publish JSON jobs.high.* / jobs.low.*| N[NATS JetStream Stream: JOBS]:::nats
-    N -->|High-Priority Subject Filter| CH[Consumer: WORKER_HIGH]:::nats
-    N -->|Low-Priority Subject Filter| CL[Consumer: WORKER_LOW]:::nats
+    P[Benchmark Producer]:::producer -->|Publish JSON payloads| N[NATS JetStream Stream: JOBS]:::nats
+    N -->|Subject: jobs.high.*| CH[Consumer: WORKER_HIGH]:::nats
+    N -->|Subject: jobs.low.*| CL[Consumer: WORKER_LOW]:::nats
 
-    CH -->|1. Poll High Queue| W1[Worker Thread 1]:::worker
-    CH -->|1. Poll High Queue| W2[Worker Thread 2]:::worker
-    CH -->|1. Poll High Queue| W3[Worker Thread 3]:::worker
-    CH -->|1. Poll High Queue| W4[Worker Thread 4]:::worker
+    CH -->|1. Primary Pull| WP[Worker Thread Pool]:::worker
+    CL -.->|2. Fallback Pull if High Empty| WP
 
-    CL -.->|2. Fallback when High is Empty| W1
-    CL -.->|2. Fallback when High is Empty| W2
-    CL -.->|2. Fallback when High is Empty| W3
-    CL -.->|2. Fallback when High is Empty| W4
-
-    W1 -->|Increment| C[Atomic Job Counter]:::metric
-    W2 -->|Increment| C
-    W3 -->|Increment| C
-    W4 -->|Increment| C
-
-    M[HTTP Metrics Server /metrics]:::metric -.->|Exposes| C
+    WP -->|Increment Processed Count| C[Atomic Job Counter]:::metric
+    M[HTTP Metrics Server /metrics]:::metric -.->|Exposes Counter| C
 ```
 
 ---
@@ -95,7 +84,7 @@ To understand the raw speed of Tachyon, we compared it against other popular que
 
 | Feature / Metric | Tachyon (Zig 0.16.0) | Rust (tokio-nats) | Go (nats.go) | Node.js (BullMQ + Redis) | Python (Celery + RabbitMQ) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Max Ingest Rate** | **33,595 jobs/sec** | ~28,400 jobs/sec | ~21,200 jobs/sec | ~7,500 jobs/sec | ~1,800 jobs/sec |
+| **Max Ingest Rate** | **71,599 jobs/sec** | ~28,400 jobs/sec | ~21,200 jobs/sec | ~7,500 jobs/sec | ~1,800 jobs/sec |
 | **Max Consume Rate** | **98,814 jobs/sec** | ~85,600 jobs/sec | ~65,400 jobs/sec | ~8,200 jobs/sec | ~2,100 jobs/sec |
 | **Idle Memory Footprint**| **< 1.0 MB** | ~3.8 MB | ~15.2 MB | ~74.0 MB | ~110.0 MB |
 | **Peak Memory Footprint**| **< 4.8 MB** (flat) | ~12.4 MB | ~48.2 MB (GC active) | ~98.0 MB | ~145.0 MB |
