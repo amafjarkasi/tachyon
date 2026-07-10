@@ -480,12 +480,14 @@ pub const NatsClient = struct {
         try self.publish(js_subject, null, config_json);
     }
 
-    pub fn requestNext(self: *NatsClient, stream_name: []const u8, consumer_name: []const u8, reply_to: []const u8, batch_size: usize) !void {
+    /// Pull the next batch. `expires_ns` is JetStream wait (e.g. 250_000_000 = 250ms).
+    /// Shorter expires = less empty-queue spin latency; longer = fewer round-trips under load.
+    pub fn requestNext(self: *NatsClient, stream_name: []const u8, consumer_name: []const u8, reply_to: []const u8, batch_size: usize, expires_ns: u64) !void {
         // Stack buffers — avoid heap alloc/free on every pull (hot path).
         var subject_buf: [160]u8 = undefined;
         const subject = try std.fmt.bufPrint(&subject_buf, "$JS.API.CONSUMER.MSG.NEXT.{s}.{s}", .{ stream_name, consumer_name });
-        var payload_buf: [64]u8 = undefined;
-        const payload = try std.fmt.bufPrint(&payload_buf, "{{\"batch\":{d},\"expires\":5000000000}}", .{batch_size});
+        var payload_buf: [80]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "{{\"batch\":{d},\"expires\":{d}}}", .{ batch_size, expires_ns });
         try self.publish(subject, reply_to, payload);
     }
 

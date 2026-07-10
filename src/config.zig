@@ -28,6 +28,12 @@ pub const AppConfig = struct {
     circuit_failure_threshold: u32 = 10,
     circuit_open_ms: u32 = 5000,
     batch_ack: bool = true,
+    /// JetStream pull expires in nanoseconds (default 250ms). Lower = snappier empty polls.
+    pull_expires_ns: u64 = 250_000_000,
+    /// When true, skip JSON parse and treat payload as opaque (throughput microbench).
+    bench_skip_json: bool = false,
+    /// Idle sleep after both high/low queues return empty (ms). 0 = busy spin.
+    empty_poll_sleep_ms: u32 = 1,
 };
 
 pub const LoadedConfig = struct {
@@ -88,6 +94,18 @@ pub fn applyEnv(app: *AppConfig, nats: *NatsConfig, environ: anytype) !void {
     }
     if (environ.get("JOB_TIMEOUT_MS")) |val| {
         app.job_timeout_ms = try std.fmt.parseInt(u32, val, 10);
+    }
+    if (environ.get("PULL_EXPIRES_NS")) |val| {
+        app.pull_expires_ns = try std.fmt.parseInt(u64, val, 10);
+    }
+    if (environ.get("BENCH_SKIP_JSON")) |val| {
+        app.bench_skip_json = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
+    }
+    if (environ.get("EMPTY_POLL_SLEEP_MS")) |val| {
+        app.empty_poll_sleep_ms = try std.fmt.parseInt(u32, val, 10);
+    }
+    if (environ.get("DEDUP_CACHE_SIZE")) |val| {
+        app.dedup_cache_size = try std.fmt.parseInt(usize, val, 10);
     }
 }
 

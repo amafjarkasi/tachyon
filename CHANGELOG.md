@@ -12,9 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Modular source layout: split `worker.zig` into `config`, `resilience`, `job`, `metrics_server`, and `logging` modules
 - Brand assets moved to `assets/` (logos, architecture diagram, logo options)
 - README: real end-to-end usage recipes (hello world, benchmark, Docker, DLQ, custom handler, shutdown)
+- README performance table updated to measured v0.2 hot-path numbers (full 150k drain)
 
 ### Added
 - Expanded `.gitignore` (OS junk, env files, coverage artifacts)
+- Configurable `pull_expires_ns`, `empty_poll_sleep_ms`, `bench_skip_json` (env: `PULL_EXPIRES_NS`, `EMPTY_POLL_SLEEP_MS`, `BENCH_SKIP_JSON`, `DEDUP_CACHE_SIZE`)
+- Empty-queue backoff + less aggressive low-priority probing when dry
+- Adaptive batch growth on full batches (not only latency samples)
+- `benchmark-producer-mt` multi-connection load generator (`--publishers N`)
+
+### Performance
+- Hot path: no per-job `+WPI`, optional skip JSON, stack `requestNext`, smarter dedup full policy
+- Bench: unique job ids; quiet `processJob`; full 150k drain in ~2–3s on local loopback
 
 ---
 

@@ -37,6 +37,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench_producer);
 
+    // Multi-connection benchmark producer
+    const bench_producer_mt = b.addExecutable(.{
+        .name = "benchmark-producer-mt",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark_producer_mt.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(bench_producer_mt);
+
     // Run steps
     const run_producer_cmd = b.addRunArtifact(producer);
     run_producer_cmd.step.dependOn(b.getInstallStep());
@@ -61,6 +72,14 @@ pub fn build(b: *std.Build) void {
     }
     const run_bench_producer_step = b.step("run-benchmark-producer", "Run the benchmark producer");
     run_bench_producer_step.dependOn(&run_bench_producer_cmd.step);
+
+    const run_bench_mt_cmd = b.addRunArtifact(bench_producer_mt);
+    run_bench_mt_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bench_mt_cmd.addArgs(args);
+    }
+    const run_bench_mt_step = b.step("run-benchmark-producer-mt", "Run multi-connection benchmark producer");
+    run_bench_mt_step.dependOn(&run_bench_mt_cmd.step);
 
     // Test step — tests.zig imports sibling modules (config, resilience, …)
     const unit_tests = b.addTest(.{

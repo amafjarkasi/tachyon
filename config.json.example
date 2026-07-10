@@ -23,5 +23,8 @@
     "dedup_cache_size": 10000,
     "circuit_failure_threshold": 10,
     "circuit_open_ms": 5000,
-    "batch_ack": true
+    "batch_ack": true,
+    "pull_expires_ns": 250000000,
+    "bench_skip_json": false,
+    "empty_poll_sleep_ms": 1
 }

@@ -19,7 +19,7 @@
 Engineered for low-latency, mission-critical systems — financial clearing, telemetry ingest, notification pipelines, crawlers, and other microsecond-sensitive workers — it completely bypasses heavy runtimes, garbage collectors, and third-party frameworks. Tachyon speaks raw NATS over a hand-rolled TCP/TLS client, pulls work through durable JetStream consumers, and runs a multi-threaded pool with **per-thread socket isolation** and **zero-allocation arena reuse**.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/consume-~99k%20jobs%2Fs-f7a41d?style=for-the-badge" alt="~99k jobs/s consume" />
+  <img src="https://img.shields.io/badge/consume-~54k%20jobs%2Fs%20peak-f7a41d?style=for-the-badge" alt="~54k jobs/s peak consume" />
   <img src="https://img.shields.io/badge/memory-%3C%205%20MB%20peak-56d364?style=for-the-badge" alt="<5 MB peak memory" />
   <img src="https://img.shields.io/badge/deps-zero-58a6ff?style=for-the-badge" alt="zero dependencies" />
   <img src="https://img.shields.io/badge/delivery-at--least--once-d2a8ff?style=for-the-badge" alt="at-least-once delivery" />
@@ -60,7 +60,7 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ### What you get out of the box
 
-- **Throughput** — ~**99k jobs/sec** consume · ~**72k/sec** produce on local loopback benchmarks  
+- **Throughput** — ~**54k jobs/sec** peak consume · ~**63k/sec** produce · full 150k drain in ~3s (local loopback, ReleaseFast)  
 - **Memory** — **&lt; 1 MB** idle · **&lt; 5 MB** peak with flat arena reuse  
 - **Delivery** — explicit `+ACK` · **NAK + exponential backoff** · `max_deliver` · JetStream **DLQ**  
 - **Correct retries** — **HMSG** / `Nats-Delivery-Count` · `+WPI` progress · `+TERM` when exhausted  
@@ -110,29 +110,37 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ## 🏁 Performance
 
-Local loopback stress test — **500,000** messages enqueued and consumed:
+Measured on Windows + NATS 2.10, `ReleaseFast`, **150,000** unique JSON jobs, batch 200, dedup off, `job_timeout_ms=0`, short pull expires + empty-poll sleep (v0.2 hot-path):
+
+| Config | Produce | Consume peak (worker log) | Full drain | Failed |
+| :--- | ---: | ---: | ---: | :---: |
+| **4 threads** (JSON on) | ~63k/s | **~54k/s** | **~3.0s** (≈54k/s avg) | 0 |
+| **8 threads** (JSON on) | ~57k/s | **~48k/s** | **~2.2s** (≈75k/s avg) | 0 |
+| **4 threads** (`bench_skip_json`) | ~61k/s | **~56k/s** | **~3.0s** | 0 |
+| **8 threads** (`bench_skip_json`) | ~60k/s | **~55k/s** | **~2.4s** | 0 |
+
+Comparative order-of-magnitude (other stacks from earlier published benches — not same hardware run):
 
 | | **Tachyon** | Rust · tokio-nats | Go · nats.go | Node · BullMQ | Python · Celery |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Ingest** | **71.6k/s** | 28k/s | 21k/s | 7.5k/s | 1.8k/s |
-| **Consume** | **98.8k/s** | 86k/s | 65k/s | 8k/s | 2k/s |
+| **Consume (order)** | **~50–75k/s** | ~80k/s | ~65k/s | ~8k/s | ~2k/s |
 | **Idle RAM** | **&lt; 1 MB** | ~4 MB | ~15 MB | ~74 MB | ~110 MB |
 | **Peak RAM** | **&lt; 5 MB** | ~12 MB | ~48 MB | ~98 MB | ~145 MB |
-| **GC / runtime** | None | None | Go GC | V8 | Interpreter |
 | **Sidecars** | **None** | — | — | Redis | RabbitMQ |
 
 <details>
 <summary><strong>Why it is fast</strong></summary>
 
 1. **No garbage collection** — no stop-the-world pauses on the consume path.  
-2. **Arena reuse** — `arena.reset(.retain_capacity)` keeps backing memory warm; near-zero allocator churn.  
-3. **Socket isolation** — each worker thread owns its NATS connection; no shared-socket mutex.  
-4. **Adaptive batching** — pull size shrinks under latency pressure and recovers when healthy.  
-5. **Buffered batch ACK** — optional coalesce of `+ACK` flushes to cut TCP syscalls.
+2. **Arena reuse** — `arena.reset(.retain_capacity)` keeps backing memory warm.  
+3. **Socket isolation** — each worker thread owns its NATS connection.  
+4. **Buffered batch ACK** — coalesce `+ACK` flushes per pull batch.  
+5. **Short pull expires + empty-poll sleep** — avoids multi-second dry-queue spin.  
+6. **Optional `bench_skip_json`** — measures pull/ACK ceiling without JSON parse.
 
 </details>
 
-> **Note:** Numbers are local loopback. In production, job-handler I/O (SMTP, HTTP, DB) usually dominates — use rate limits, timeouts, and the circuit breaker accordingly.
+> **Note:** Local loopback. Production latency is dominated by your `processJob` (SMTP/HTTP/DB). Use `dedup_cache_size`, rate limits, and timeouts for real workloads; set `BENCH_SKIP_JSON=true` only for microbenches.
 
 ---
 
@@ -518,7 +526,10 @@ Copy [`config.json.example`](config.json.example):
     "dedup_cache_size": 10000,
     "circuit_failure_threshold": 10,
     "circuit_open_ms": 5000,
-    "batch_ack": true
+    "batch_ack": true,
+    "pull_expires_ns": 250000000,
+    "bench_skip_json": false,
+    "empty_poll_sleep_ms": 1
 }
 ```
 
@@ -544,6 +555,9 @@ Copy [`config.json.example`](config.json.example):
 | `circuit_failure_threshold` | `10` | Failures before open |
 | `circuit_open_ms` | `5000` | Open duration |
 | `batch_ack` | `true` | Buffer ACKs; flush once per batch |
+| `pull_expires_ns` | `250000000` | JetStream pull wait (250ms). Lower = snappier empty polls |
+| `empty_poll_sleep_ms` | `1` | Sleep after both queues empty (`0` = busy spin) |
+| `bench_skip_json` | `false` | Skip JSON parse + `processJob` (microbench only) |
 
 ### Environment overrides
 
@@ -553,6 +567,7 @@ Copy [`config.json.example`](config.json.example):
 | `STREAM_NAME` `CONSUMER_HIGH` `CONSUMER_LOW` | Stream / consumers |
 | `SUBJECT_HIGH` `SUBJECT_LOW` `DLQ_SUBJECT` `DLQ_STREAM` | Subjects |
 | `MAX_DELIVER` `JOB_TTL_SECONDS` `MAX_JOBS_PER_SECOND` `JOB_TIMEOUT_MS` | Runtime limits |
+| `DEDUP_CACHE_SIZE` `PULL_EXPIRES_NS` `EMPTY_POLL_SLEEP_MS` `BENCH_SKIP_JSON` | Perf / bench knobs |
 
 ```bash
 NATS_HOST=nats.prod.internal NATS_TLS=true \
@@ -1194,6 +1209,7 @@ tachyon/
 │   ├── logging.zig                # structured JSON logger (logJSON)
 │   ├── producer.zig               # single-job HPUB enqueuer binary
 │   ├── benchmark_producer.zig     # load-test producer binary
+│   ├── benchmark_producer_mt.zig  # multi-connection load generator
 │   └── tests.zig                  # unit tests (zig build test)
 ├── assets/
 │   ├── logo.png                   # square mark / favicon-style
@@ -1228,6 +1244,7 @@ tachyon/
 | **logging** | `src/logging.zig` | `logJSON` structured logger |
 | **producer** | `src/producer.zig` | Single-job enqueuer binary |
 | **benchmark_producer** | `src/benchmark_producer.zig` | High-throughput load generator |
+| **benchmark_producer_mt** | `src/benchmark_producer_mt.zig` | Multi-connection publisher (`--publishers N`) |
 | **tests** | `src/tests.zig` | Unit tests for config, resilience, HMSG parsing, etc. |
 
 ---

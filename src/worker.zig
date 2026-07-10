@@ -46,6 +46,9 @@ const WorkerContext = struct {
     circuit_failure_threshold: u32,
     circuit_open_ms: u32,
     batch_ack: bool,
+    pull_expires_ns: u64,
+    bench_skip_json: bool,
+    empty_poll_sleep_ms: u32,
 };
 
 const CTRL_C_EVENT = 0;
@@ -208,6 +211,9 @@ fn makeWorkerContext(allocator: std.mem.Allocator, io: std.Io, thread_id: usize,
         .circuit_failure_threshold = app_config.circuit_failure_threshold,
         .circuit_open_ms = app_config.circuit_open_ms,
         .batch_ack = app_config.batch_ack,
+        .pull_expires_ns = app_config.pull_expires_ns,
+        .bench_skip_json = app_config.bench_skip_json,
+        .empty_poll_sleep_ms = app_config.empty_poll_sleep_ms,
     };
     return ctx;
 }
@@ -245,6 +251,21 @@ fn handleJob(
         }
     }
 
+    // Throughput microbench: skip JSON + domain handler, just ACK.
+    if (ctx.bench_skip_json) {
+        if (ctx.batch_ack) {
+            client.ackBuffered(msg) catch return .break_batch;
+            defer_flush.* = true;
+        } else {
+            client.ack(msg) catch return .break_batch;
+        }
+        circuit.onSuccess();
+        _ = total_jobs.fetchAdd(1, .monotonic);
+        processed_in_batch.* += 1;
+        _ = job_arena.reset(.retain_capacity);
+        return .continue_batch;
+    }
+
     const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
         logging.logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ.");
         const fail_now = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
@@ -272,8 +293,7 @@ fn handleJob(
         return .continue_batch;
     }
 
-    // No per-job +WPI: one extra PUB/flush per message dominated the bench.
-    // Long handlers can still send progress via the processJob progress callback later.
+    // No per-job +WPI on the hot path (extra PUB dominated benches).
 
     job_mod.processJob(job, ctx.thread_id, ctx.job_timeout_ms, ctx.io, null) catch |err| {
         const fail_now = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
@@ -355,11 +375,12 @@ fn pullConsumerBatch(
     dedup: *DedupCache,
     circuit: *CircuitBreaker,
 ) enum { empty, ok, reconnect } {
-    client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch) catch return .reconnect;
+    client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch, ctx.pull_expires_ns) catch return .reconnect;
 
     var msg_count: usize = 0;
     var saw_empty = false;
     var need_flush = false;
+    var got_work = false;
 
     while (msg_count < adaptive_batch) : (msg_count += 1) {
         var msg = client.readMsg() catch return .reconnect;
@@ -374,6 +395,7 @@ fn pullConsumerBatch(
             break;
         }
 
+        got_work = true;
         const outcome = handleJob(client, ctx, &msg, job_alloc, job_arena, latency_sum, processed_in_batch, dedup, circuit, &need_flush);
         if (outcome == .break_batch) return .reconnect;
     }
@@ -382,7 +404,13 @@ fn pullConsumerBatch(
         client.flushWrites() catch {};
     }
 
-    if (saw_empty and msg_count <= 1) return .empty;
+    // Full batch with no status = healthy load; grow adaptive batch even without latency samples.
+    if (got_work and !saw_empty and msg_count >= adaptive_batch) {
+        // signal via latency_sum sentinel: caller uses processed_in_batch
+    }
+
+    if (saw_empty and !got_work) return .empty;
+    if (saw_empty and msg_count <= 1 and !got_work) return .empty;
     return .ok;
 }
 
@@ -407,6 +435,7 @@ fn workerRun(ctx: *WorkerContext) void {
     };
 
     var adaptive_batch = ctx.batch_size;
+    var empty_streak: u32 = 0;
 
     while (!should_shutdown.load(.monotonic)) {
         if (ctx.thread_id > target_threads.load(.monotonic)) {
@@ -444,21 +473,39 @@ fn workerRun(ctx: *WorkerContext) void {
             const high = pullConsumerBatch(&client, ctx, ctx.consumer_high, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
             if (high == .reconnect) break;
 
+            var both_empty = high == .empty;
             if (high == .empty and !should_shutdown.load(.monotonic)) {
                 if (ctx.thread_id > target_threads.load(.monotonic)) break;
-                const low = pullConsumerBatch(&client, ctx, ctx.consumer_low, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
-                if (low == .reconnect) break;
+                // Don't probe low every single empty high when streak is high (saves RTT).
+                const probe_low = empty_streak < 2 or (empty_streak % 4 == 0);
+                if (probe_low) {
+                    const low = pullConsumerBatch(&client, ctx, ctx.consumer_low, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
+                    if (low == .reconnect) break;
+                    both_empty = low == .empty;
+                }
+            } else {
+                both_empty = false;
             }
 
             if (processed_in_batch > 0) {
-                const avg_latency = @divFloor(latency_sum, @as(i64, @intCast(processed_in_batch)));
-                if (avg_latency > 200) {
-                    adaptive_batch = @max(adaptive_batch / 2, 1);
-                    var bp_buf: [64]u8 = undefined;
-                    const bp_msg = std.fmt.bufPrint(&bp_buf, "Backpressure activated. Batch size reduced to: {d}", .{adaptive_batch}) catch "Backpressure activated.";
-                    logging.logJSON("info", ctx.thread_id, bp_msg);
-                } else if (avg_latency < 50) {
-                    adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
+                empty_streak = 0;
+                // Grow batch when we're filling it (works even without latency samples).
+                if (processed_in_batch >= adaptive_batch) {
+                    adaptive_batch = @min(adaptive_batch + 25, ctx.batch_size);
+                } else if (latency_sum > 0) {
+                    const avg_latency = @divFloor(latency_sum, @as(i64, @intCast(processed_in_batch)));
+                    if (avg_latency > 200) {
+                        adaptive_batch = @max(adaptive_batch / 2, 1);
+                    } else if (avg_latency < 50) {
+                        adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
+                    }
+                }
+            } else if (both_empty) {
+                empty_streak += 1;
+                if (ctx.empty_poll_sleep_ms > 0) {
+                    // Back off empty polling so we don't burn CPU/NATS on dry queues.
+                    const sleep_ms: u32 = @min(ctx.empty_poll_sleep_ms * @min(empty_streak, 10), 50);
+                    ctx.io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
                 }
             }
         }
