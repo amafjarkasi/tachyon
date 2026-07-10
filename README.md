@@ -410,10 +410,11 @@ Default JSON shape (producer + worker):
 }
 ```
 
-Hook your domain logic in `processJob` inside [`src/worker.zig`](src/worker.zig):
+Hook your domain logic in `processJob` inside [`src/job.zig`](src/job.zig):
 
 ```zig
-fn processJob(job: Job, thread_id: usize, timeout_ms: u32, io: std.Io, progress: ?*const fn () void) !void {
+// src/job.zig
+pub fn processJob(job: Job, thread_id: usize, timeout_ms: u32, io: std.Io, progress: ?*const fn () void) !void {
     // send email · call HTTP API · write to DB · …
     _ = .{ job, thread_id, timeout_ms, io, progress };
 }
@@ -998,7 +999,7 @@ Run a 3/5-node JetStream cluster; point all workers at a load-balanced `NATS_HOS
 | `JetStream not enabled` | Restart NATS with `-js` or JetStream block in config |
 | TLS handshake fails | Verify `nats_tls`, CA path, and cert SAN vs `nats_host` |
 | Workers never scale up | Auto-scale needs **&gt; 30k jobs/sec**; load with `benchmark-producer` |
-| Port 8080 in use | Metrics bind fails silently — free the port or change the bind in `worker.zig` |
+| Port 8080 in use | Metrics bind fails silently — free the port or change the bind in `src/metrics_server.zig` |
 | Jobs redeliver forever | Check `max_deliver`; poison JSON should DLQ+TERM, not loop |
 | Shutdown kills mid-job on Linux | Ensure you run a build with POSIX `sigaction` (v0.2+); prefer `SIGTERM` over `SIGKILL` |
 | DLQ empty | Confirm stream `DEAD_LETTERS` exists (`nats stream ls`); worker creates it on boot |
@@ -1019,22 +1020,35 @@ nats stream view DEAD_LETTERS
 ```text
 tachyon/
 ├── src/
-│   ├── worker.zig              # pool, retry, health, metrics, processJob
-│   ├── nats_client.zig         # raw NATS/JetStream TCP+TLS client
+│   ├── worker.zig              # main: pool, pull loop, auto-scale, signals
+│   ├── nats_client.zig         # raw NATS/JetStream TCP+TLS client (HMSG, ACK/NAK)
+│   ├── config.zig              # AppConfig + JSON / env / CLI loading
+│   ├── resilience.zig          # backoff, jitter, rate limit, circuit breaker, dedup
+│   ├── job.zig                 # Job payload + processJob domain handler
+│   ├── metrics_server.zig      # HTTP /health + /metrics
+│   ├── logging.zig             # structured JSON logger
 │   ├── producer.zig            # single-job HPUB enqueuer
 │   ├── benchmark_producer.zig  # load generator
-│   └── tests.zig               # pure unit tests (zig build test)
+│   └── tests.zig               # unit tests (zig build test)
 ├── config.json.example
 ├── build.zig / build.zig.zon
 ├── Dockerfile
-├── logo.png                    # icon (avatar)
-├── logo-banner.png             # README hero
-├── logo_v4.png                 # legacy mark
+├── logo.png / logo-banner.png  # brand assets
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
 ├── SECURITY.md
 └── LICENSE
 ```
+
+| Module | Responsibility |
+| :--- | :--- |
+| `nats_client` | Protocol only — connect, PUB/HPUB, MSG/HMSG, JetStream admin, ACK family |
+| `config` | Defaults, `config.json`, env overrides, CLI flags |
+| `resilience` | Pure helpers: backoff, jitter, rate limit, circuit breaker, dedup cache |
+| `job` | Payload struct + `processJob` (swap this for your domain logic) |
+| `metrics_server` | Detached HTTP server for probes and Prometheus |
+| `logging` | `logJSON` structured logger |
+| `worker` | Orchestration — threads, pull routing, handleJob, auto-scale |
 
 ---
 

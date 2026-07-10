@@ -2,6 +2,8 @@
 //! Run with: zig build test
 
 const std = @import("std");
+const AppConfig = @import("config.zig").AppConfig;
+const resilience = @import("resilience.zig");
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Adaptive Batching Math
@@ -107,30 +109,8 @@ test "auto-scale: does NOT scale down below minimum" {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Config JSON Parsing
+// Config JSON Parsing (shared AppConfig module)
 // ──────────────────────────────────────────────────────────────────────────────
-
-const AppConfig = struct {
-    nats_host: []const u8 = "127.0.0.1",
-    nats_port: u16 = 4222,
-    nats_user: ?[]const u8 = null,
-    nats_pass: ?[]const u8 = null,
-    nats_tls: bool = false,
-    nats_ca_path: ?[]const u8 = null,
-    worker_threads: usize = 4,
-    worker_batch: usize = 50,
-    stream_name: []const u8 = "JOBS",
-    consumer_high: []const u8 = "WORKER_HIGH",
-    consumer_low: []const u8 = "WORKER_LOW",
-    subject_high: []const u8 = "jobs.high.*",
-    subject_low: []const u8 = "jobs.low.*",
-    dlq_subject: []const u8 = "jobs.failed",
-    max_deliver: u32 = 5,
-    retry_base_ms: u32 = 1000,
-    retry_max_ms: u32 = 30000,
-    job_ttl_seconds: u64 = 0,
-    max_jobs_per_second: u32 = 0,
-};
 
 test "config: parses valid config.json structure" {
     const json =
@@ -261,29 +241,21 @@ test "nack: delayed NAK body includes nanoseconds" {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Retry exponential backoff
+// Retry exponential backoff (resilience module)
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn computeBackoffNs(attempt: u32, base_ms: u32, max_ms: u32) u64 {
-    var shift: u5 = 0;
-    if (attempt > 1) shift = @intCast(@min(attempt - 1, 16));
-    const raw: u64 = @as(u64, base_ms) << shift;
-    const capped: u64 = @min(raw, @as(u64, max_ms));
-    return capped * 1_000_000;
-}
-
 test "retry backoff: first attempt is base delay" {
-    const ns = computeBackoffNs(1, 1000, 30000);
+    const ns = resilience.computeBackoffNs(1, 1000, 30000);
     try std.testing.expectEqual(@as(u64, 1_000_000_000), ns);
 }
 
 test "retry backoff: doubles each attempt" {
-    try std.testing.expectEqual(@as(u64, 2_000_000_000), computeBackoffNs(2, 1000, 30000));
-    try std.testing.expectEqual(@as(u64, 4_000_000_000), computeBackoffNs(3, 1000, 30000));
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), resilience.computeBackoffNs(2, 1000, 30000));
+    try std.testing.expectEqual(@as(u64, 4_000_000_000), resilience.computeBackoffNs(3, 1000, 30000));
 }
 
 test "retry backoff: caps at max_ms" {
-    const ns = computeBackoffNs(20, 1000, 30000);
+    const ns = resilience.computeBackoffNs(20, 1000, 30000);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), ns);
 }
 
@@ -320,36 +292,19 @@ test "ttl: seconds to nanoseconds" {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Rate limiting
+// Rate limiting + reconnect jitter (resilience module)
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn rateLimitSleepMs(max_jobs_per_second: u32) u32 {
-    if (max_jobs_per_second == 0) return 0;
-    return @max(1, 1000 / max_jobs_per_second);
-}
-
 test "rate limit: unlimited is zero sleep" {
-    try std.testing.expectEqual(@as(u32, 0), rateLimitSleepMs(0));
+    try std.testing.expectEqual(@as(u32, 0), resilience.rateLimitSleepMs(0));
 }
 
 test "rate limit: 10/sec is 100ms spacing" {
-    try std.testing.expectEqual(@as(u32, 100), rateLimitSleepMs(10));
+    try std.testing.expectEqual(@as(u32, 100), resilience.rateLimitSleepMs(10));
 }
 
 test "rate limit: 1000/sec is 1ms spacing" {
-    try std.testing.expectEqual(@as(u32, 1), rateLimitSleepMs(1000));
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Reconnect jitter
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn withJitter(backoff_ms: u32, seed: u64) u32 {
-    const span: u64 = 50;
-    const r = (seed *% 1103515245 +% 12345) % (span + 1); // 0..50
-    const pct: u64 = 75 + r; // 75..125
-    const jittered: u64 = (@as(u64, backoff_ms) * pct) / 100;
-    return @intCast(@min(jittered, 60_000));
+    try std.testing.expectEqual(@as(u32, 1), resilience.rateLimitSleepMs(1000));
 }
 
 test "jitter: stays within 75%-125% band" {
@@ -357,7 +312,7 @@ test "jitter: stays within 75%-125% band" {
     var s: u64 = 1;
     var i: usize = 0;
     while (i < 20) : (i += 1) {
-        const j = withJitter(base, s);
+        const j = resilience.withJitter(base, s);
         s += 1;
         try std.testing.expect(j >= 750 and j <= 1250);
     }
@@ -478,48 +433,11 @@ test "hmsg: parses HMSG line without reply-to" {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Circuit breaker
+// Circuit breaker + dedup (resilience module)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const CircuitState = enum { closed, open, half_open };
-const CircuitBreaker = struct {
-    state: CircuitState = .closed,
-    consecutive_failures: u32 = 0,
-    open_until_ms: i64 = 0,
-    failure_threshold: u32,
-    open_ms: u32,
-
-    fn allow(self: *CircuitBreaker, now_ms: i64) bool {
-        return switch (self.state) {
-            .closed => true,
-            .half_open => true,
-            .open => {
-                if (now_ms >= self.open_until_ms) {
-                    self.state = .half_open;
-                    return true;
-                }
-                return false;
-            },
-        };
-    }
-    fn onSuccess(self: *CircuitBreaker) void {
-        self.consecutive_failures = 0;
-        self.state = .closed;
-    }
-    fn onFailure(self: *CircuitBreaker, now_ms: i64) void {
-        self.consecutive_failures += 1;
-        if (self.consecutive_failures >= self.failure_threshold) {
-            self.state = .open;
-            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
-        } else if (self.state == .half_open) {
-            self.state = .open;
-            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
-        }
-    }
-};
-
 test "circuit: opens after threshold failures" {
-    var cb = CircuitBreaker{ .failure_threshold = 3, .open_ms = 1000 };
+    var cb = resilience.CircuitBreaker{ .failure_threshold = 3, .open_ms = 1000 };
     cb.onFailure(0);
     cb.onFailure(1);
     try std.testing.expect(cb.allow(2));
@@ -532,10 +450,6 @@ test "circuit: opens after threshold failures" {
     try std.testing.expect(cb.state == .closed);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Job timeout + dedup
-// ──────────────────────────────────────────────────────────────────────────────
-
 test "timeout: exceeds limit" {
     const timeout_ms: i64 = 5000;
     const elapsed_ms: i64 = 5200;
@@ -543,11 +457,11 @@ test "timeout: exceeds limit" {
 }
 
 test "dedup: second insert is duplicate" {
-    var map = std.StringHashMap(void).init(std.testing.allocator);
-    defer map.deinit();
-    try map.put("job_1", {});
-    try std.testing.expect(map.contains("job_1"));
-    try std.testing.expect(!map.contains("job_2"));
+    var cache = resilience.DedupCache.init(std.testing.allocator, 100);
+    defer cache.deinit();
+    cache.remember("job_1");
+    try std.testing.expect(cache.contains("job_1"));
+    try std.testing.expect(!cache.contains("job_2"));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

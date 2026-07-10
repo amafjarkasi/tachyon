@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const run_bench_producer_step = b.step("run-benchmark-producer", "Run the benchmark producer");
     run_bench_producer_step.dependOn(&run_bench_producer_cmd.step);
 
-    // Test step
+    // Test step — tests.zig imports sibling modules (config, resilience, …)
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
