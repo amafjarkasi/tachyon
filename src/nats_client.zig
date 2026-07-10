@@ -481,12 +481,11 @@ pub const NatsClient = struct {
     }
 
     pub fn requestNext(self: *NatsClient, stream_name: []const u8, consumer_name: []const u8, reply_to: []const u8, batch_size: usize) !void {
-        const subject = try std.fmt.allocPrint(self.allocator, "$JS.API.CONSUMER.MSG.NEXT.{s}.{s}", .{ stream_name, consumer_name });
-        defer self.allocator.free(subject);
-
-        const payload = try std.fmt.allocPrint(self.allocator, "{{\"batch\":{d},\"expires\":5000000000}}", .{batch_size});
-        defer self.allocator.free(payload);
-
+        // Stack buffers — avoid heap alloc/free on every pull (hot path).
+        var subject_buf: [160]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buf, "$JS.API.CONSUMER.MSG.NEXT.{s}.{s}", .{ stream_name, consumer_name });
+        var payload_buf: [64]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "{{\"batch\":{d},\"expires\":5000000000}}", .{batch_size});
         try self.publish(subject, reply_to, payload);
     }
 

@@ -49,6 +49,8 @@ pub const CircuitBreaker = struct {
     }
 
     pub fn onSuccess(self: *CircuitBreaker) void {
+        // Hot path: skip work when already healthy
+        if (self.state == .closed and self.consecutive_failures == 0) return;
         self.consecutive_failures = 0;
         self.state = .closed;
     }
@@ -66,6 +68,8 @@ pub const CircuitBreaker = struct {
 };
 
 /// Bounded job-id dedup cache. Keys are owned by the map (allocator-backed).
+/// `max_size == 0` disables dedup entirely (fast path for pure throughput benches).
+/// When full, new ids are not inserted (no free-all eviction storm).
 pub const DedupCache = struct {
     map: std.StringHashMap(void),
     allocator: std.mem.Allocator,
@@ -87,18 +91,22 @@ pub const DedupCache = struct {
         self.map.deinit();
     }
 
+    pub fn enabled(self: *const DedupCache) bool {
+        return self.max_size > 0;
+    }
+
     pub fn contains(self: *const DedupCache, id: []const u8) bool {
+        if (self.max_size == 0) return false;
         return self.map.contains(id);
     }
 
     pub fn remember(self: *DedupCache, id: []const u8) void {
+        if (self.max_size == 0) return;
         if (self.map.count() >= self.max_size) {
-            var it = self.map.keyIterator();
-            while (it.next()) |k| {
-                self.allocator.free(k.*);
-            }
-            self.map.clearRetainingCapacity();
+            // Do not clear the whole map (O(n) free storm). Stop tracking new ids.
+            return;
         }
+        if (self.map.contains(id)) return;
         if (self.allocator.dupe(u8, id)) |id_copy| {
             self.map.put(id_copy, {}) catch {
                 self.allocator.free(id_copy);

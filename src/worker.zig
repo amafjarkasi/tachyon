@@ -229,33 +229,39 @@ fn handleJob(
     circuit: *CircuitBreaker,
     defer_flush: *bool,
 ) JobOutcome {
-    const job_start = std.Io.Timestamp.now(ctx.io, .awake);
-    const now_ms = job_start.toMilliseconds();
+    // Skip wall-clock work when timeouts are disabled (pure throughput path).
+    const track_time = ctx.job_timeout_ms > 0;
+    const job_start = if (track_time) std.Io.Timestamp.now(ctx.io, .awake) else null;
 
-    if (!circuit.allow(now_ms)) {
-        const delay = resilience.computeBackoffNs(1, ctx.retry_base_ms, ctx.retry_max_ms);
-        client.nack(msg, delay) catch {};
-        logging.logJSON("warn", ctx.thread_id, "Circuit open; NACKed job without processing.");
-        _ = job_arena.reset(.retain_capacity);
-        return .continue_batch;
+    // Circuit is closed with zero failures almost always — allow() is free then.
+    // Only sample clock when the breaker is not fully healthy.
+    if (circuit.state != .closed or circuit.consecutive_failures > 0) {
+        const now_ms = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
+        if (!circuit.allow(now_ms)) {
+            const delay = resilience.computeBackoffNs(1, ctx.retry_base_ms, ctx.retry_max_ms);
+            client.nack(msg, delay) catch {};
+            _ = job_arena.reset(.retain_capacity);
+            return .continue_batch;
+        }
     }
 
     const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
         logging.logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ.");
+        const fail_now = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
         client.publish(ctx.dlq_subject, null, msg.payload) catch {};
         client.term(msg) catch {
             client.ack(msg) catch {};
         };
         _ = failed_jobs.fetchAdd(1, .monotonic);
-        circuit.onFailure(now_ms);
+        circuit.onFailure(fail_now);
         _ = job_arena.reset(.retain_capacity);
         return .continue_batch;
     };
 
     const job = parsed.value;
 
-    if (dedup.contains(job.id)) {
-        logging.logJSON("info", ctx.thread_id, "Duplicate job.id skipped (idempotent ACK).");
+    // Dedup: silent ACK (no per-job log — destroys throughput under load)
+    if (dedup.enabled() and dedup.contains(job.id)) {
         if (ctx.batch_ack) {
             client.ackBuffered(msg) catch return .break_batch;
             defer_flush.* = true;
@@ -266,9 +272,11 @@ fn handleJob(
         return .continue_batch;
     }
 
-    client.inProgress(msg) catch {};
+    // No per-job +WPI: one extra PUB/flush per message dominated the bench.
+    // Long handlers can still send progress via the processJob progress callback later.
 
     job_mod.processJob(job, ctx.thread_id, ctx.job_timeout_ms, ctx.io, null) catch |err| {
+        const fail_now = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
         const attempt = if (msg.delivery_count == 0) @as(u32, 1) else msg.delivery_count;
         if (attempt >= ctx.max_deliver) {
             logging.logJSON("error", ctx.thread_id, "Max deliveries reached; routing to DLQ + TERM.");
@@ -277,29 +285,38 @@ fn handleJob(
                 client.ack(msg) catch {};
             };
             _ = failed_jobs.fetchAdd(1, .monotonic);
-            circuit.onFailure(now_ms);
+            circuit.onFailure(fail_now);
         } else {
             const delay = resilience.computeBackoffNs(attempt, ctx.retry_base_ms, ctx.retry_max_ms);
             client.nack(msg, delay) catch {};
             var err_buf: [96]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "Job failed ({s}) attempt={d}; NACKed with backoff.", .{ @errorName(err), attempt }) catch "Job failed; NACKed.";
             logging.logJSON("warn", ctx.thread_id, err_msg);
-            circuit.onFailure(now_ms);
+            circuit.onFailure(fail_now);
         }
         _ = job_arena.reset(.retain_capacity);
         return .continue_batch;
     };
 
-    if (ctx.job_timeout_ms > 0) {
-        const elapsed = job_start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
-        if (elapsed > ctx.job_timeout_ms) {
-            const attempt = if (msg.delivery_count == 0) @as(u32, 1) else msg.delivery_count;
-            const delay = resilience.computeBackoffNs(attempt, ctx.retry_base_ms, ctx.retry_max_ms);
-            client.nack(msg, delay) catch {};
-            logging.logJSON("warn", ctx.thread_id, "Job exceeded timeout; NACKed.");
-            circuit.onFailure(now_ms);
-            _ = job_arena.reset(.retain_capacity);
-            return .continue_batch;
+    if (track_time) {
+        if (job_start) |start| {
+            const elapsed = start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
+            if (elapsed > ctx.job_timeout_ms) {
+                const fail_now = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
+                const attempt = if (msg.delivery_count == 0) @as(u32, 1) else msg.delivery_count;
+                const delay = resilience.computeBackoffNs(attempt, ctx.retry_base_ms, ctx.retry_max_ms);
+                client.nack(msg, delay) catch {};
+                logging.logJSON("warn", ctx.thread_id, "Job exceeded timeout; NACKed.");
+                circuit.onFailure(fail_now);
+                _ = job_arena.reset(.retain_capacity);
+                return .continue_batch;
+            }
+            latency_sum.* += elapsed;
+            if (elapsed > 500) {
+                var lat_buf: [64]u8 = undefined;
+                const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{elapsed}) catch "Job SLA violated";
+                logging.logJSON("warn", ctx.thread_id, lat_msg);
+            }
         }
     }
 
@@ -314,18 +331,7 @@ fn handleJob(
 
     circuit.onSuccess();
     _ = total_jobs.fetchAdd(1, .monotonic);
-
-    const job_end = std.Io.Timestamp.now(ctx.io, .awake);
-    const latency = job_start.durationTo(job_end);
-    const latency_ms = latency.toMilliseconds();
-    latency_sum.* += latency_ms;
     processed_in_batch.* += 1;
-
-    if (latency_ms > 500) {
-        var lat_buf: [64]u8 = undefined;
-        const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
-        logging.logJSON("warn", ctx.thread_id, lat_msg);
-    }
 
     if (ctx.max_jobs_per_second > 0) {
         const sleep_ms = resilience.rateLimitSleepMs(ctx.max_jobs_per_second);
