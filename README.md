@@ -457,7 +457,7 @@ flowchart TB
 1. `requestNext` pull batch from high (then low) consumer  
 2. `readMsg` → parse `MSG`/`HMSG`, extract `delivery_count`  
 3. Circuit check → JSON parse → dedup by `job.id`  
-4. `+WPI` → `processJob` (your domain logic)  
+4. `+WPI` → `processJob` in `src/job.zig` (your domain logic)  
 5. Success → buffered `+ACK` · Failure → `-NAK` or DLQ + `+TERM`  
 6. Batch end → `flushWrites` · adaptive batch size update  
 
@@ -876,7 +876,7 @@ pub fn processPushNotification(allocator: std.mem.Allocator, payload: []const u8
 
 ## 💻 Detailed Usage Examples
 
-Complete, copy-adaptable programs for enqueuing work and running a multi-threaded consumer. These mirror the patterns in `src/producer.zig` and `src/worker.zig` (simplified for teaching).
+Complete, copy-adaptable programs for enqueuing work and running a multi-threaded consumer. These mirror the patterns in `src/producer.zig`, `src/worker.zig`, `src/job.zig`, and `src/nats_client.zig` (simplified for teaching).
 
 ### 1. Standalone Production Producer (Enqueuer)
 This complete program demonstrates establishing connection configs, wrapping streams, serializing nested payload structures, and flushing commands synchronously:
@@ -1184,33 +1184,51 @@ nats stream view DEAD_LETTERS
 
 ```text
 tachyon/
-├── src/                        # Zig sources (modules + binaries)
-│   ├── worker.zig              # main: pool, pull loop, auto-scale, signals
-│   ├── nats_client.zig         # raw NATS/JetStream TCP+TLS client
-│   ├── config.zig / job.zig / resilience.zig / metrics_server.zig / logging.zig
-│   ├── producer.zig / benchmark_producer.zig
-│   └── tests.zig
-├── assets/                     # logos, architecture diagram, logo options
-│   ├── logo.png / logo-banner.png
-│   └── logo-options/
-├── docs/superpowers/           # design plans (agent/internal)
-├── .github/workflows/ci.yml
+├── src/
+│   ├── worker.zig                 # main binary: pool, pull loop, auto-scale, signals
+│   ├── nats_client.zig            # NATS/JetStream TCP+TLS client (HMSG, ACK/NAK/TERM/WPI)
+│   ├── config.zig                 # AppConfig + config.json / env / CLI loading
+│   ├── resilience.zig             # backoff, jitter, rate limit, circuit breaker, dedup
+│   ├── job.zig                    # Job payload + processJob domain handler
+│   ├── metrics_server.zig         # HTTP /health + /metrics
+│   ├── logging.zig                # structured JSON logger (logJSON)
+│   ├── producer.zig               # single-job HPUB enqueuer binary
+│   ├── benchmark_producer.zig     # load-test producer binary
+│   └── tests.zig                  # unit tests (zig build test)
+├── assets/
+│   ├── logo.png                   # square mark / favicon-style
+│   ├── logo-banner.png            # README hero wordmark
+│   ├── logo-banner-sm.png
+│   ├── logo_v4.png                # legacy mark
+│   ├── architecture.png
+│   └── logo-options/              # design explorations
+├── docs/
+│   └── superpowers/               # internal design/implementation plans
+├── .github/
+│   └── workflows/ci.yml
 ├── config.json.example
-├── build.zig / build.zig.zon
+├── build.zig
+├── build.zig.zon
 ├── Dockerfile
-├── CHANGELOG.md / CONTRIBUTING.md / SECURITY.md / LICENSE
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── LICENSE
 └── README.md
 ```
 
-| Module | Responsibility |
-| :--- | :--- |
-| `nats_client` | Protocol only — connect, PUB/HPUB, MSG/HMSG, JetStream admin, ACK family |
-| `config` | Defaults, `config.json`, env overrides, CLI flags |
-| `resilience` | Pure helpers: backoff, jitter, rate limit, circuit breaker, dedup cache |
-| `job` | Payload struct + `processJob` (swap this for your domain logic) |
-| `metrics_server` | Detached HTTP server for probes and Prometheus |
-| `logging` | `logJSON` structured logger |
-| `worker` | Orchestration — threads, pull routing, handleJob, auto-scale |
+| Module | File | Responsibility |
+| :--- | :--- | :--- |
+| **worker** | `src/worker.zig` | Orchestration — threads, pull routing, `handleJob`, auto-scale, signals |
+| **nats_client** | `src/nats_client.zig` | Protocol only — connect, PUB/HPUB, MSG/HMSG, JetStream admin, ACK family |
+| **config** | `src/config.zig` | Defaults, `config.json`, env overrides, CLI flags |
+| **resilience** | `src/resilience.zig` | Pure helpers: backoff, jitter, rate limit, circuit breaker, dedup cache |
+| **job** | `src/job.zig` | Payload struct + `processJob` (**swap this for your domain logic**) |
+| **metrics_server** | `src/metrics_server.zig` | Detached HTTP server for `/health` and Prometheus `/metrics` |
+| **logging** | `src/logging.zig` | `logJSON` structured logger |
+| **producer** | `src/producer.zig` | Single-job enqueuer binary |
+| **benchmark_producer** | `src/benchmark_producer.zig` | High-throughput load generator |
+| **tests** | `src/tests.zig` | Unit tests for config, resilience, HMSG parsing, etc. |
 
 ---
 
