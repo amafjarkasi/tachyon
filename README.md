@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="720" />
+  <img src="logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="640" />
 </p>
 
 <p align="center">
