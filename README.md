@@ -202,6 +202,101 @@ pub fn processAnalyticsJob(allocator: std.mem.Allocator, payload: []const u8) !v
 }
 ```
 
+### 4. Distributed Web Scraping / Crawler Queue
+Parses link targets, executes async HTTP fetches, and extracts content metadata:
+
+```zig
+const CrawlJob = struct {
+    url: []const u8,
+    depth_limit: u8 = 3,
+    user_agent: []const u8 = "TachyonCrawler/1.0",
+    selectors: []const []const u8,
+};
+
+pub fn processCrawlJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(CrawlJob, alloc, payload, .{});
+    const job = parsed.value;
+
+    std.debug.print("[Web Crawler] Starting scrap job for URL: {s}\n", .{job.url});
+    std.debug.print("[Web Crawler] Applying selector query criteria count: {d}\n", .{job.selectors.len});
+    
+    // (Async HTTP fetch, HTML parsing, and database storage operations occur here...)
+    std.debug.print("[Web Crawler] Scrap job completed successfully for {s}.\n", .{job.url});
+}
+```
+
+### 5. Fintech Transaction Settlement Clearing Worker
+Clears pending ledger bank balances and records double-entry bookkeeping ledgers:
+
+```zig
+const SettlementJob = struct {
+    transaction_id: []const u8,
+    source_account: []const u8,
+    destination_account: []const u8,
+    amount_cents: u64,
+    currency: []const u8 = "USD",
+};
+
+pub fn processSettlementJob(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(SettlementJob, alloc, payload, .{});
+    const tx = parsed.value;
+
+    std.debug.print("[Fintech Core] Settling TX: {s}...\n", .{tx.transaction_id});
+    std.debug.print("[Fintech Core] Routing {s} {d}.{02d} from {s} to {s}\n", .{
+        tx.currency,
+        tx.amount_cents / 100,
+        tx.amount_cents % 100,
+        tx.source_account,
+        tx.destination_account,
+    });
+
+    // (Execute ACID balance checks, lock accounts, write ledger tables...)
+    std.debug.print("[Fintech Core] TX {s} cleared successfully.\n", .{tx.transaction_id});
+}
+```
+
+### 6. Mobile Device Real-Time Push Notification Engine
+Routes notifications to mobile notification gateways with device tokens and rate-limiting limits:
+
+```zig
+const PushNotificationJob = struct {
+    device_token: []const u8,
+    platform: enum { ios, android },
+    payload: struct {
+        alert_title: []const u8,
+        alert_body: []const u8,
+        badge_count: ?u32 = null,
+    },
+};
+
+pub fn processPushNotification(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(PushNotificationJob, alloc, payload, .{});
+    const note = parsed.value;
+
+    std.debug.print("[Push Engine] Dispatching alert to platform: {s}\n", .{@tagName(note.platform)});
+    std.debug.print("[Push Engine] Alert Title: {s}\n", .{note.payload.alert_title});
+
+    if (note.payload.badge_count) |badge| {
+        std.debug.print("[Push Engine] Setting badge count to: {d}\n", .{badge});
+    }
+
+    // (APNs/FCM HTTP2 connection dispatch and retry logic occurs here...)
+    std.debug.print("[Push Engine] Notification successfully pushed to token: {s}\n", .{note.device_token[0..8]});
+}
+```
+
 ---
 
 ## 💻 Detailed Usage Examples
