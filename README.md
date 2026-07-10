@@ -573,3 +573,131 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/metrics
 # TYPE zig_jobs_processed_total counter
 zig_jobs_processed_total 150000
 ```
+
+---
+
+## 🛡️ Production Deployment Guide
+
+Deploying Tachyon in a production environment requires configuring highly available NATS JetStream storage, daemonizing execution on system services, and integrating containerized platforms.
+
+### 1. NATS JetStream Clustering Setup
+For high availability (HA), NATS JetStream should run in a 3-node or 5-node cluster configuration. Create a `cluster.conf` configuration file:
+
+```text
+port: 4222
+monitor_port: 8222
+
+jetstream {
+  store_dir: "/var/lib/nats/jetstream"
+  max_mem: 8GB
+  max_file: 100GB
+}
+
+cluster {
+  name: "TACHYON_CLUSTER"
+  listen: "0.0.0.0:6222"
+  routes = [
+    "nats-route://node-1.internal:6222"
+    "nats-route://node-2.internal:6222"
+    "nats-route://node-3.internal:6222"
+  ]
+}
+```
+Start the daemon on each node:
+```bash
+nats-server -c cluster.conf
+```
+
+### 2. Kubernetes Orchestration Manifests
+Define a local configuration map and deployment to manage worker thread pool execution in Kubernetes clusters:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tachyon-config
+  namespace: default
+data:
+  config.json: |
+    {
+      "nats_host": "nats-cluster.default.svc.cluster.local",
+      "nats_port": 4222,
+      "nats_tls": true,
+      "nats_ca_path": "/etc/ssl/certs/ca-certificates.crt",
+      "worker_threads": 8,
+      "worker_batch": 100
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tachyon-worker-pool
+  namespace: default
+  labels:
+    app: tachyon-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tachyon-worker
+  template:
+    metadata:
+      labels:
+        app: tachyon-worker
+    spec:
+      containers:
+      - name: worker
+        image: amafjarkasi/tachyon:1.0.0
+        command: ["./worker"]
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app
+        ports:
+        - containerPort: 8080 # Metrics port
+          name: http-metrics
+        resources:
+          limits:
+            cpu: "2"
+            memory: 128Mi
+          requests:
+            cpu: "500m"
+            memory: 32Mi
+      volumes:
+      - name: config-volume
+        configMap:
+          name: tachyon-config
+```
+
+### 3. systemd Linux Service Daemonizing
+To run Tachyon as a background service on Linux virtual machines, create a systemd unit configuration `/etc/systemd/system/tachyon.service`:
+
+```ini
+[Unit]
+Description=Tachyon High-Performance Background Worker Pool
+After=network.target nats-server.service
+Requires=nats-server.service
+
+[Service]
+Type=simple
+User=tachyon
+WorkingDirectory=/opt/tachyon
+ExecStart=/opt/tachyon/worker --threads 8 --batch 150
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+Environment="NATS_HOST=127.0.0.1" "NATS_PORT=4222"
+
+[Install]
+WantedBy=multi-user.target
+```
+Enable and launch the system daemon:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable tachyon
+sudo systemctl start tachyon
+```
+Check health logs:
+```bash
+journalctl -u tachyon -n 50 -f
+```
+
