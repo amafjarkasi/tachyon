@@ -1,7 +1,7 @@
 # Tachyon
 
 <p align="center">
-  <img src="logo_v2.png" alt="Tachyon Logo" width="360" />
+  <img src="logo_v3.png" alt="Tachyon Logo" width="360" />
 </p>
 
 Tachyon is a zero-dependency, ultra-high-performance background job processing library built natively in **Zig 0.16.0** and powered by the **NATS JetStream** protocol. Engineered for low-latency, mission-critical systems (such as financial transaction processors, telemetry ingest engines, and microsecond-sensitive microservices), Tachyon completely bypasses heavy runtime engines, garbage collectors (GC), and third-party frameworks.
