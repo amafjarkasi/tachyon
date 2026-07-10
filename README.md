@@ -27,14 +27,36 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ### Why teams pick Tachyon
 
-| Pillar | What you get |
-| :--- | :--- |
-| **Zig edge** | Deterministic native code, no GC pauses, full control of every byte on the hot path |
-| **JetStream native** | Durable streams, pull consumers, priority subjects, explicit ACK / NAK |
-| **Zero deps** | Only the Zig standard library — no crates, no npm, no Redis sidecar |
-| **Socket isolation** | One NATS connection per worker thread — no shared-socket mutex |
-| **Arena reuse** | `arena.reset(.retain_capacity)` keeps memory flat under load |
-| **Production resilience** | Retries, DLQ, circuit breaker, timeouts, dedup, graceful SIGTERM drain |
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <strong>⚡ Zig edge</strong><br/>
+      Deterministic native code, no GC pauses, full control of every byte on the hot path
+    </td>
+    <td align="center" width="33%">
+      <strong>📡 JetStream native</strong><br/>
+      Durable streams, pull consumers, priority subjects, explicit ACK / NAK
+    </td>
+    <td align="center" width="33%">
+      <strong>🔒 Zero deps</strong><br/>
+      Only the Zig standard library — no crates, no npm, no Redis sidecar
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <strong>🧵 Socket isolation</strong><br/>
+      One NATS connection per worker thread — no shared-socket mutex
+    </td>
+    <td align="center" width="33%">
+      <strong>♻️ Arena reuse</strong><br/>
+      <code>arena.reset(.retain_capacity)</code> keeps memory flat under load
+    </td>
+    <td align="center" width="33%">
+      <strong>🛡️ Production resilience</strong><br/>
+      Retries, DLQ, circuit breaker, timeouts, dedup, graceful SIGTERM drain
+    </td>
+  </tr>
+</table>
 
 ### What you get out of the box
 
