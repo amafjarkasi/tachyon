@@ -217,8 +217,8 @@ pub fn processAnalyticsJob(allocator: std.mem.Allocator, payload: []const u8) !v
 
 ## 💻 Detailed Usage Examples
 
-### 1. Publishing a Job (Producer Example)
-Below is a complete, line-by-line example of how to connect to NATS, serialize a structured job payload using Zig's native JSON library, and publish it into the stream:
+### 1. Standalone Production Producer (Enqueuer)
+This complete program demonstrates establishing connection configs, wrapping streams, serializing nested payload structures, and flushing commands synchronously:
 
 ```zig
 const std = @import("std");
@@ -234,87 +234,202 @@ const JobPayload = struct {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const allocator = std.heap.page_allocator;
+    
+    // Setup clean General Purpose Allocator
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    // Connect to the NATS broker
-    var client = try NatsClient.connect(io, allocator, .{
+    // 1. Configure Connection Details
+    const config = Config{
         .host = "127.0.0.1",
         .port = 4222,
-        .use_tls = false,
-    });
-    defer client.deinit();
-
-    // Define the job data structure
-    const job = JobPayload{
-        .id = "job-102",
-        .email = "customer@example.com",
-        .subject = "Order Dispatched!",
-        .body = "Your Tachyon order has been shipped.",
+        .username = null, // Set if authentication required
+        .password = null,
+        .use_tls = false, // Set to true for secure clusters
+        .ca_path = null,
     };
 
-    // Serialize the struct to a JSON string buffer
+    std.debug.print("Connecting to NATS JetStream broker at {s}:{d}...\n", .{config.host, config.port});
+    var client = try NatsClient.connect(io, allocator, config);
+    defer client.deinit();
+    std.debug.print("Connected successfully!\n", .{});
+
+    // 2. Initialize Stream and Priority Consumer Groups
+    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" });
+    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*");
+    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*");
+    try client.flush(); // Flush socket to ensure NATS registers entities
+
+    // 3. Serialize structured JSON data
+    const job = JobPayload{
+        .id = "evt_99012a",
+        .email = "billing@company.com",
+        .subject = "Invoice Settled: #10922",
+        .body = "Thank you! Your payment of $499.00 has been processed successfully.",
+    };
+
     var payload_list = std.ArrayList(u8).empty;
     defer payload_list.deinit(allocator);
     try std.json.stringify(job, .{}, payload_list.writer(allocator));
 
-    // Publish the job to NATS JetStream priority subjects
-    try client.publish("jobs.high.notifications", null, payload_list.items);
-    std.debug.print("Successfully enqueued job {s}!\n", .{job.id});
+    // 4. Publish to NATS JetStream High Priority Subject
+    std.debug.print("Publishing high priority payload: {s}\n", .{job.id});
+    try client.publish("jobs.high.billing", null, payload_list.items);
+    try client.flush(); // Guarantee transmission
+    
+    std.debug.print("Enqueued job {s} successfully!\n", .{job.id});
 }
 ```
 
-### 2. Standard Worker Message Consumer Loop
-Below is a clean, modular example showing how to run a worker processing loop. It includes zero-allocation memory reuse using `reset(.retain_capacity)` and explicit message acknowledgment:
+### 2. Multi-Threaded Concurrent Worker & Telemetry Manager
+This production-grade script illustrates the worker manager loop, thread-local connection instances, priority fallback routing, zero-allocation memory arena resets, and backpressure batch throttling:
 
 ```zig
 const std = @import("std");
 const NatsClient = @import("nats_client.zig").NatsClient;
 const Config = @import("nats_client.zig").Config;
 
-pub fn workerThread(io: std.Io, gpa: std.mem.Allocator, config: Config) !void {
-    // Connect a dedicated client socket for this thread
-    var client = try NatsClient.connect(io, gpa, config);
-    defer client.deinit();
+const Job = struct {
+    id: []const u8,
+    email: []const u8,
+    subject: []const u8,
+    body: []const u8,
+};
 
-    const inbox = "inbox.worker_pool";
-    try client.subscribe(inbox, "1");
+// Thread context structure
+const WorkerContext = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    thread_id: usize,
+    batch_size: usize,
+    config: Config,
+};
 
-    // Initialize the reusable arena allocator outside the hot loop
-    var job_arena = std.heap.ArenaAllocator.init(gpa);
+// Global indicators for pool management
+var should_shutdown = std.atomic.Value(bool).init(false);
+var target_threads = std.atomic.Value(usize).init(4);
+var total_jobs = std.atomic.Value(usize).init(0);
+
+pub fn workerThreadRun(ctx: *WorkerContext) void {
+    defer ctx.allocator.destroy(ctx);
+    
+    var inbox_buf: [64]u8 = undefined;
+    const inbox = std.fmt.bufPrint(&inbox_buf, "inbox.worker_t{d}", .{ctx.thread_id}) catch return;
+
+    // Initialize local Arena Allocator outside the loop (prevents heap fragmentation)
+    var job_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer job_arena.deinit();
     const job_alloc = job_arena.allocator();
 
-    while (true) {
-        // Request a batch of 50 messages from the NATS JetStream Consumer (WORKER_HIGH)
-        try client.requestNext("JOBS", "WORKER_HIGH", inbox, 50);
+    var adaptive_batch = ctx.batch_size;
+    var backoff_ms: u32 = 1000;
 
-        var msg_count: usize = 0;
-        while (msg_count < 50) : (msg_count += 1) {
-            var msg = try client.readMsg();
-            defer msg.deinit();
+    while (!should_shutdown.load(.monotonic)) {
+        // Scale-down check: terminate thread if target pool count is reduced
+        if (ctx.thread_id > target_threads.load(.monotonic)) {
+            std.debug.print("[Thread {d}] Down-scaled. Terminating thread cleanly.\n", .{ctx.thread_id});
+            break;
+        }
 
-            // End-of-batch or empty check
-            if (msg.payload.len == 0 or std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
-                break;
+        // Establish connection with backoff retry
+        var client = NatsClient.connect(ctx.io, ctx.allocator, ctx.config) catch |err| {
+            std.debug.print("[Thread {d}] Connect error: {}. Retrying in {d}ms...\n", .{ctx.thread_id, err, backoff_ms});
+            ctx.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            backoff_ms = @min(backoff_ms * 2, 30000);
+            continue;
+        };
+        backoff_ms = 1000;
+        defer client.deinit();
+
+        client.subscribe(inbox, "1") catch continue;
+
+        while (!should_shutdown.load(.monotonic)) {
+            if (ctx.thread_id > target_threads.load(.monotonic)) break;
+
+            // 1. Priority Pull: Request from WORKER_HIGH
+            client.requestNext("JOBS", "WORKER_HIGH", inbox, adaptive_batch) catch break;
+
+            var msg_count: usize = 0;
+            var is_high_empty = false;
+            var batch_latency_sum: i64 = 0;
+            var processed_in_batch: usize = 0;
+
+            while (msg_count < adaptive_batch) : (msg_count += 1) {
+                var msg = client.readMsg() catch break;
+                defer msg.deinit();
+
+                // Empty queue or timeout status check
+                if (msg.payload.len == 0 or std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
+                    is_high_empty = true;
+                    break;
+                }
+
+                const start_t = std.Io.Timestamp.now(ctx.io, .awake);
+
+                // Parse payload inside reusable arena memory
+                const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
+                    std.debug.print("[Thread {d}] Corrupt payload. Routing to DLQ...\n", .{ctx.thread_id});
+                    client.publish("jobs.failed", null, msg.payload) catch {};
+                    client.ack(&msg) catch {};
+                    _ = job_arena.reset(.retain_capacity);
+                    continue;
+                };
+
+                // Execute business logic...
+                std.debug.print("Job {s} processed for {s}\n", .{parsed.value.id, parsed.value.email});
+
+                client.ack(&msg) catch break;
+                _ = total_jobs.fetchAdd(1, .monotonic);
+
+                // Latency tracking
+                const end_t = std.Io.Timestamp.now(ctx.io, .awake);
+                batch_latency_sum += start_t.durationTo(end_t).toMilliseconds();
+                processed_in_batch += 1;
+
+                // Reset arena but retain capacity (Zero heap allocations!)
+                _ = job_arena.reset(.retain_capacity);
             }
 
-            // Parse the JSON payload using the reusable arena
-            const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
-                std.debug.print("Corrupted payload detected. Forwarding to DLQ...\n", .{});
-                try client.publish("jobs.failed", null, msg.payload);
-                try client.ack(&msg);
-                _ = job_arena.reset(.retain_capacity);
-                continue;
-            };
-            
-            // Execute business logic (e.g. processing the job)
-            std.debug.print("Processing Job ID: {s} for {s}\n", .{ parsed.value.id, parsed.value.email });
+            // 2. Fallback Pull: Poll WORKER_LOW if high priority returned empty
+            if (is_high_empty and !should_shutdown.load(.monotonic)) {
+                client.requestNext("JOBS", "WORKER_LOW", inbox, adaptive_batch) catch break;
+                msg_count = 0;
+                while (msg_count < adaptive_batch) : (msg_count += 1) {
+                    var msg = client.readMsg() catch break;
+                    defer msg.deinit();
 
-            // Acknowledge the message to complete processing
-            try client.ack(&msg);
+                    if (msg.payload.len == 0 or std.mem.startsWith(u8, msg.payload, "NATS/1.0")) break;
 
-            // Reset the arena, keeping the pre-allocated memory chunk ready
-            _ = job_arena.reset(.retain_capacity);
+                    const start_t = std.Io.Timestamp.now(ctx.io, .awake);
+                    const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
+                        client.publish("jobs.failed", null, msg.payload) catch {};
+                        client.ack(&msg) catch {};
+                        _ = job_arena.reset(.retain_capacity);
+                        continue;
+                    };
+
+                    std.debug.print("Low-Priority Job {s} processed.\n", .{parsed.value.id});
+                    client.ack(&msg) catch break;
+                    _ = total_jobs.fetchAdd(1, .monotonic);
+
+                    batch_latency_sum += start_t.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
+                    processed_in_batch += 1;
+                    _ = job_arena.reset(.retain_capacity);
+                }
+            }
+
+            // 3. Adaptive Batching Backpressure Control
+            if (processed_in_batch > 0) {
+                const avg_lat = @divFloor(batch_latency_sum, @as(i64, @intCast(processed_in_batch)));
+                if (avg_lat > 200) {
+                    // Backpressure throttle batch size
+                    adaptive_batch = @max(adaptive_batch / 2, 1);
+                } else if (avg_lat < 50) {
+                    // Recover batch size
+                    adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
+                }
+            }
         }
     }
 }
