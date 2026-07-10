@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Modular source layout: split `worker.zig` into `config`, `resilience`, `job`, `metrics_server`, and `logging` modules
 - Brand assets moved to `assets/` (logos, architecture diagram, logo options)
 - README: real end-to-end usage recipes (hello world, benchmark, Docker, DLQ, custom handler, shutdown)
-- README performance table updated to measured v0.2 hot-path numbers (full 150k drain)
+- README performance table updated to latest measured hot-path numbers (~62–65k/s peak, full 150k drain)
 
 ### Added
 - Expanded `.gitignore` (OS junk, env files, coverage artifacts)

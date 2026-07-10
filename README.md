@@ -19,7 +19,7 @@
 Engineered for low-latency, mission-critical systems — financial clearing, telemetry ingest, notification pipelines, crawlers, and other microsecond-sensitive workers — it completely bypasses heavy runtimes, garbage collectors, and third-party frameworks. Tachyon speaks raw NATS over a hand-rolled TCP/TLS client, pulls work through durable JetStream consumers, and runs a multi-threaded pool with **per-thread socket isolation** and **zero-allocation arena reuse**.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/consume-~54k%20jobs%2Fs%20peak-f7a41d?style=for-the-badge" alt="~54k jobs/s peak consume" />
+  <img src="https://img.shields.io/badge/consume-~65k%20jobs%2Fs%20peak-f7a41d?style=for-the-badge" alt="~65k jobs/s peak consume" />
   <img src="https://img.shields.io/badge/memory-%3C%205%20MB%20peak-56d364?style=for-the-badge" alt="<5 MB peak memory" />
   <img src="https://img.shields.io/badge/deps-zero-58a6ff?style=for-the-badge" alt="zero dependencies" />
   <img src="https://img.shields.io/badge/delivery-at--least--once-d2a8ff?style=for-the-badge" alt="at-least-once delivery" />
@@ -60,7 +60,7 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ### What you get out of the box
 
-- **Throughput** — ~**54k jobs/sec** peak consume · ~**63k/sec** produce · full 150k drain in ~3s (local loopback, ReleaseFast)  
+- **Throughput** — ~**62–65k jobs/sec** peak consume · ~**54–56k/sec** produce · full 150k drain keeps up with publish (local loopback, ReleaseFast)  
 - **Memory** — **&lt; 1 MB** idle · **&lt; 5 MB** peak with flat arena reuse  
 - **Delivery** — explicit `+ACK` · **NAK + exponential backoff** · `max_deliver` · JetStream **DLQ**  
 - **Correct retries** — **HMSG** / `Nats-Delivery-Count` · `+WPI` progress · `+TERM` when exhausted  
@@ -110,20 +110,21 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ## 🏁 Performance
 
-Measured on Windows + NATS 2.10, `ReleaseFast`, **150,000** unique JSON jobs, batch 200, dedup off, `job_timeout_ms=0`, short pull expires + empty-poll sleep (v0.2 hot-path):
+Latest measured run (Windows + NATS 2.10, `ReleaseFast`, **150,000** unique JSON jobs, batch 200, dedup off, `job_timeout_ms=0`, ACK flush every 64, pull prefetch, adaptive expires — commit hot-path):
 
 | Config | Produce | Consume peak (worker log) | Full drain | Failed |
 | :--- | ---: | ---: | ---: | :---: |
-| **4 threads** (JSON on) | ~63k/s | **~54k/s** | **~3.0s** (≈54k/s avg) | 0 |
-| **8 threads** (JSON on) | ~57k/s | **~48k/s** | **~2.2s** (≈75k/s avg) | 0 |
-| **4 threads** (`bench_skip_json`) | ~61k/s | **~56k/s** | **~3.0s** | 0 |
-| **8 threads** (`bench_skip_json`) | ~60k/s | **~55k/s** | **~2.4s** | 0 |
+| **4 threads** (JSON on) | ~54k/s | **~62k/s** | **yes** (keeps up with publish) | 0 |
+| **8 threads** (JSON on) | ~55k/s | **~65k/s** | **yes** | 0 |
+| **8 threads** (`bench_skip_json`) | ~53k/s | **~64k/s** | **yes** | 0 |
+
+Early sustained samples were ~**28–32k/s**, with a peak second ~**62–65k/s** as the queue flushed. Produce is single-connection (~**53–56k/s**).
 
 Comparative order-of-magnitude (other stacks from earlier published benches — not same hardware run):
 
 | | **Tachyon** | Rust · tokio-nats | Go · nats.go | Node · BullMQ | Python · Celery |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Consume (order)** | **~50–75k/s** | ~80k/s | ~65k/s | ~8k/s | ~2k/s |
+| **Consume (order)** | **~60–65k/s peak** | ~80k/s | ~65k/s | ~8k/s | ~2k/s |
 | **Idle RAM** | **&lt; 1 MB** | ~4 MB | ~15 MB | ~74 MB | ~110 MB |
 | **Peak RAM** | **&lt; 5 MB** | ~12 MB | ~48 MB | ~98 MB | ~145 MB |
 | **Sidecars** | **None** | — | — | Redis | RabbitMQ |
@@ -134,9 +135,10 @@ Comparative order-of-magnitude (other stacks from earlier published benches — 
 1. **No garbage collection** — no stop-the-world pauses on the consume path.  
 2. **Arena reuse** — `arena.reset(.retain_capacity)` keeps backing memory warm.  
 3. **Socket isolation** — each worker thread owns its NATS connection.  
-4. **Buffered batch ACK** — coalesce `+ACK` flushes per pull batch.  
-5. **Short pull expires + empty-poll sleep** — avoids multi-second dry-queue spin.  
-6. **Optional `bench_skip_json`** — measures pull/ACK ceiling without JSON parse.
+4. **Buffered batch ACK** — coalesce `+ACK` flushes (`ack_flush_every`, default 64).  
+5. **Pull prefetch** — next `requestNext` issued mid-batch to hide RTT.  
+6. **Adaptive pull expires** — long when busy, short when empty + empty-poll sleep.  
+7. **Optional `bench_skip_json`** — measures pull/ACK ceiling without JSON parse.
 
 </details>
 
