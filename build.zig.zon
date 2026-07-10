@@ -1,0 +1,11 @@
+.{
+    .name = .tachyon,
+    .version = "0.1.0",
+    .fingerprint = 0xcdcad68d1723b13a,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

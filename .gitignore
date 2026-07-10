@@ -1,0 +1,21 @@
+# Zig build directories
+.zig-cache/
+zig-out/
+
+# Executables and debug files
+*.exe
+*.pdb
+*.o
+*.obj
+
+# Local configuration files
+config.json
+
+# IDE settings
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
