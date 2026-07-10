@@ -37,9 +37,11 @@ pub const AppConfig = struct {
     /// Idle sleep after both high/low queues return empty (ms). 0 = busy spin.
     empty_poll_sleep_ms: u32 = 1,
     /// Flush buffered +ACKs every N acks (0 = flush only at end of pull batch).
-    ack_flush_every: u32 = 64,
+    ack_flush_every: u32 = 128,
     /// Issue next requestNext before finishing current batch (prefetch).
     pull_prefetch: bool = true,
+    /// When true, only pull the high-priority consumer (skips low fallback RTT).
+    single_consumer_mode: bool = false,
 };
 
 pub const LoadedConfig = struct {
@@ -121,6 +123,12 @@ pub fn applyEnv(app: *AppConfig, nats: *NatsConfig, environ: anytype) !void {
     }
     if (environ.get("PULL_PREFETCH")) |val| {
         app.pull_prefetch = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
+    }
+    if (environ.get("SINGLE_CONSUMER_MODE")) |val| {
+        app.single_consumer_mode = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
+    }
+    if (environ.get("WORKER_BATCH")) |val| {
+        app.worker_batch = try std.fmt.parseInt(usize, val, 10);
     }
 }
 

@@ -20,6 +20,13 @@ pub fn main(init: std.process.Init) !void {
         config.use_tls = std.mem.eql(u8, val, "true");
     }
 
+    // Default: all HIGH (best for single_consumer_mode benches).
+    // Set BENCH_SPLIT_LOW=true for classic 80/20 high/low priority mix.
+    const split_low = if (init.environ_map.get("BENCH_SPLIT_LOW")) |v|
+        std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1")
+    else
+        false;
+
     var count: usize = 50000;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -44,8 +51,6 @@ pub fn main(init: std.process.Init) !void {
     try client.flush();
 
     // Unique job.id per message so in-process dedup does not skip work.
-    // Fixed body fields; only the id digits change for max publish speed.
-    // {"id":"job_000000000000","email":"bench@example.com","subject":"Antigravity Load Test","body":"Fast background job processing load testing with raw TCP socket."}
     const prefix = "{\"id\":\"job_";
     const suffix = "\",\"email\":\"bench@example.com\",\"subject\":\"Antigravity Load Test\",\"body\":\"Fast background job processing load testing with raw TCP socket.\"}";
     var id_digits: [12]u8 = undefined;
@@ -56,13 +61,16 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(payload_buf[suffix_off .. suffix_off + suffix.len], suffix);
     const payload_len = suffix_off + suffix.len;
 
-    std.debug.print("Starting benchmark enqueuing of {d} jobs...\n", .{count});
+    if (split_low) {
+        std.debug.print("Starting benchmark enqueuing of {d} jobs (80%% high / 20%% low)...\n", .{count});
+    } else {
+        std.debug.print("Starting benchmark enqueuing of {d} jobs (100%% high)...\n", .{count});
+    }
 
     const start_time = std.Io.Timestamp.now(io, .awake);
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        // zero-pad 12-digit id
         var n = i;
         var d: usize = 12;
         while (d > 0) {
@@ -73,12 +81,17 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(payload_buf[id_off .. id_off + 12], &id_digits);
         const payload = payload_buf[0..payload_len];
 
-        if (i % 5 == 0) {
-            try client.publish("jobs.low.email", null, payload);
+        // Buffer publishes; flush every 64 to cut syscall overhead.
+        if (split_low and i % 5 == 0) {
+            try client.publishRaw("jobs.low.email", null, payload, false);
         } else {
-            try client.publish("jobs.high.email", null, payload);
+            try client.publishRaw("jobs.high.email", null, payload, false);
+        }
+        if ((i + 1) % 64 == 0) {
+            try client.flushWrites();
         }
     }
+    try client.flushWrites();
 
     const end_time = std.Io.Timestamp.now(io, .awake);
     const elapsed_duration = start_time.durationTo(end_time);

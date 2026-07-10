@@ -19,7 +19,7 @@
 Engineered for low-latency, mission-critical systems — financial clearing, telemetry ingest, notification pipelines, crawlers, and other microsecond-sensitive workers — it completely bypasses heavy runtimes, garbage collectors, and third-party frameworks. Tachyon speaks raw NATS over a hand-rolled TCP/TLS client, pulls work through durable JetStream consumers, and runs a multi-threaded pool with **per-thread socket isolation** and **zero-allocation arena reuse**.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/consume-~65k%20jobs%2Fs%20peak-f7a41d?style=for-the-badge" alt="~65k jobs/s peak consume" />
+  <img src="https://img.shields.io/badge/consume-~92k%20jobs%2Fs%20peak-f7a41d?style=for-the-badge" alt="~92k jobs/s peak consume" />
   <img src="https://img.shields.io/badge/memory-%3C%205%20MB%20peak-56d364?style=for-the-badge" alt="<5 MB peak memory" />
   <img src="https://img.shields.io/badge/deps-zero-58a6ff?style=for-the-badge" alt="zero dependencies" />
   <img src="https://img.shields.io/badge/delivery-at--least--once-d2a8ff?style=for-the-badge" alt="at-least-once delivery" />
@@ -60,7 +60,7 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ### What you get out of the box
 
-- **Throughput** — ~**62–65k jobs/sec** peak consume · ~**54–56k/sec** produce · full 150k drain keeps up with publish (local loopback, ReleaseFast)  
+- **Throughput** — ~**74–92k jobs/sec** peak consume · ~**54k+/sec** produce (local loopback, ReleaseFast; single-consumer bench)  
 - **Memory** — **&lt; 1 MB** idle · **&lt; 5 MB** peak with flat arena reuse  
 - **Delivery** — explicit `+ACK` · **NAK + exponential backoff** · `max_deliver` · JetStream **DLQ**  
 - **Correct retries** — **HMSG** / `Nats-Delivery-Count` · `+WPI` progress · `+TERM` when exhausted  
@@ -110,21 +110,21 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ## 🏁 Performance
 
-Latest measured run (Windows + NATS 2.10, `ReleaseFast`, **150,000** unique JSON jobs, batch 200, dedup off, `job_timeout_ms=0`, ACK flush every 64, pull prefetch, adaptive expires — commit hot-path):
+Latest measured peaks (Windows + NATS 2.10, `ReleaseFast`, **200,000** unique jobs, batch 400, dedup off, timeouts off, ACK flush 128, prefetch, adaptive expires, **`single_consumer_mode`**, 100% high-priority subjects):
 
-| Config | Produce | Consume peak (worker log) | Full drain | Failed |
-| :--- | ---: | ---: | ---: | :---: |
-| **4 threads** (JSON on) | ~54k/s | **~62k/s** | **yes** (keeps up with publish) | 0 |
-| **8 threads** (JSON on) | ~55k/s | **~65k/s** | **yes** | 0 |
-| **8 threads** (`bench_skip_json`) | ~53k/s | **~64k/s** | **yes** | 0 |
+| Config | Consume peak (worker log) | Notes |
+| :--- | ---: | :--- |
+| **4 threads** (JSON on) | **~92k/s** | Best peak on this machine |
+| **8 threads** (JSON on) | **~74k/s** | More contention, still strong |
+| **8 threads** (`bench_skip_json`) | **~80k/s** | Pull/ACK ceiling without JSON |
 
-Early sustained samples were ~**28–32k/s**, with a peak second ~**62–65k/s** as the queue flushed. Produce is single-connection (~**53–56k/s**).
+Earlier dual-priority (80/20 high/low) full-drain runs hit ~**62–65k/s** peaks with complete 150k drain. Produce (single connection, buffered flush) is ~**54k/s**.
 
 Comparative order-of-magnitude (other stacks from earlier published benches — not same hardware run):
 
 | | **Tachyon** | Rust · tokio-nats | Go · nats.go | Node · BullMQ | Python · Celery |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Consume (order)** | **~60–65k/s peak** | ~80k/s | ~65k/s | ~8k/s | ~2k/s |
+| **Consume (order)** | **~74–92k/s peak** | ~80–86k/s | ~65k/s | ~8k/s | ~2k/s |
 | **Idle RAM** | **&lt; 1 MB** | ~4 MB | ~15 MB | ~74 MB | ~110 MB |
 | **Peak RAM** | **&lt; 5 MB** | ~12 MB | ~48 MB | ~98 MB | ~145 MB |
 | **Sidecars** | **None** | — | — | Redis | RabbitMQ |
@@ -133,16 +133,16 @@ Comparative order-of-magnitude (other stacks from earlier published benches — 
 <summary><strong>Why it is fast</strong></summary>
 
 1. **No garbage collection** — no stop-the-world pauses on the consume path.  
-2. **Arena reuse** — `arena.reset(.retain_capacity)` keeps backing memory warm.  
+2. **Reused `msg_arena`** — no per-message Arena init/deinit.  
 3. **Socket isolation** — each worker thread owns its NATS connection.  
-4. **Buffered batch ACK** — coalesce `+ACK` flushes (`ack_flush_every`, default 64).  
-5. **Pull prefetch** — next `requestNext` issued mid-batch to hide RTT.  
-6. **Adaptive pull expires** — long when busy, short when empty + empty-poll sleep.  
-7. **Optional `bench_skip_json`** — measures pull/ACK ceiling without JSON parse.
+4. **Fast-path `ackBuffered`** + flush every N (`ack_flush_every`).  
+5. **Pull prefetch** — next `requestNext` mid-batch to hide RTT.  
+6. **Adaptive pull expires** — long when busy, short when empty.  
+7. **64KB TCP buffers** + optional `single_consumer_mode` / `bench_skip_json`.
 
 </details>
 
-> **Note:** Local loopback. Production latency is dominated by your `processJob` (SMTP/HTTP/DB). Use `dedup_cache_size`, rate limits, and timeouts for real workloads; set `BENCH_SKIP_JSON=true` only for microbenches.
+> **Note:** Local loopback. Production latency is dominated by your `processJob` (SMTP/HTTP/DB). Use `dedup_cache_size`, rate limits, and timeouts for real workloads. For microbenches: `SINGLE_CONSUMER_MODE=true`, `DEDUP_CACHE_SIZE=0`, `BENCH_SKIP_JSON=true`.
 
 ---
 
@@ -563,8 +563,9 @@ Copy [`config.json.example`](config.json.example):
 | `pull_expires_ns` | `1000000000` | JetStream pull wait when busy (1s) |
 | `pull_expires_empty_ns` | `50000000` | Pull wait when queues look empty (50ms) |
 | `empty_poll_sleep_ms` | `1` | Sleep after both queues empty (`0` = busy spin) |
-| `ack_flush_every` | `64` | Flush buffered `+ACK`s every N acks (`0` = end of batch only) |
+| `ack_flush_every` | `128` | Flush buffered `+ACK`s every N acks (`0` = end of batch only) |
 | `pull_prefetch` | `true` | Issue next `requestNext` mid-batch (overlap RTT) |
+| `single_consumer_mode` | `false` | Only pull high consumer (skip low fallback RTT) |
 | `bench_skip_json` | `false` | Skip JSON parse + `processJob` (microbench only) |
 
 ### Environment overrides
@@ -576,7 +577,7 @@ Copy [`config.json.example`](config.json.example):
 | `SUBJECT_HIGH` `SUBJECT_LOW` `DLQ_SUBJECT` `DLQ_STREAM` | Subjects |
 | `MAX_DELIVER` `JOB_TTL_SECONDS` `MAX_JOBS_PER_SECOND` `JOB_TIMEOUT_MS` | Runtime limits |
 | `DEDUP_CACHE_SIZE` `PULL_EXPIRES_NS` `PULL_EXPIRES_EMPTY_NS` `EMPTY_POLL_SLEEP_MS` | Pull / dedup |
-| `ACK_FLUSH_EVERY` `PULL_PREFETCH` `BENCH_SKIP_JSON` | ACK batching / prefetch / microbench |
+| `ACK_FLUSH_EVERY` `PULL_PREFETCH` `SINGLE_CONSUMER_MODE` `BENCH_SKIP_JSON` | ACK / prefetch / bench modes |
 
 ```bash
 NATS_HOST=nats.prod.internal NATS_TLS=true \

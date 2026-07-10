@@ -52,6 +52,7 @@ const WorkerContext = struct {
     empty_poll_sleep_ms: u32,
     ack_flush_every: u32,
     pull_prefetch: bool,
+    single_consumer_mode: bool,
 };
 
 const CTRL_C_EVENT = 0;
@@ -220,6 +221,7 @@ fn makeWorkerContext(allocator: std.mem.Allocator, io: std.Io, thread_id: usize,
         .empty_poll_sleep_ms = app_config.empty_poll_sleep_ms,
         .ack_flush_every = app_config.ack_flush_every,
         .pull_prefetch = app_config.pull_prefetch,
+        .single_consumer_mode = app_config.single_consumer_mode,
     };
     return ctx;
 }
@@ -273,10 +275,9 @@ fn handleJob(
         } else {
             client.ack(msg) catch return .break_batch;
         }
-        circuit.onSuccess();
         _ = total_jobs.fetchAdd(1, .monotonic);
         processed_in_batch.* += 1;
-        _ = job_arena.reset(.retain_capacity);
+        // No job_arena.reset — unused in skip-json path.
         return .continue_batch;
     }
 
@@ -366,6 +367,7 @@ fn handleJob(
     }
 
     circuit.onSuccess();
+    // Defer atomic add to batch end when possible — still increment here for metrics accuracy under scale-down.
     _ = total_jobs.fetchAdd(1, .monotonic);
     processed_in_batch.* += 1;
 
@@ -374,6 +376,7 @@ fn handleJob(
         ctx.io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
     }
 
+    // Arena reset is relatively cheap with retain_capacity; keep for JSON path.
     _ = job_arena.reset(.retain_capacity);
     return .continue_batch;
 }
@@ -502,7 +505,8 @@ fn workerRun(ctx: *WorkerContext) void {
             if (high == .reconnect) break;
 
             var both_empty = high == .empty;
-            if (high == .empty and !should_shutdown.load(.monotonic)) {
+            // Single-consumer mode: never probe low (bench / single-queue deployments).
+            if (!ctx.single_consumer_mode and high == .empty and !should_shutdown.load(.monotonic)) {
                 if (ctx.thread_id > target_threads.load(.monotonic)) break;
                 // Probe low less often when dry (saves RTT).
                 const probe_low = empty_streak < 2 or (empty_streak % 4 == 0);
@@ -512,7 +516,7 @@ fn workerRun(ctx: *WorkerContext) void {
                     if (low == .reconnect) break;
                     both_empty = low == .empty;
                 }
-            } else {
+            } else if (high != .empty) {
                 both_empty = false;
             }
 

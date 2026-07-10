@@ -32,17 +32,19 @@ pub const NatsClient = struct {
     tls_reader_buf: ?[]u8 = null,
     tls_writer_buf: ?[]u8 = null,
     connection: Connection,
+    /// Reused for every readMsg — avoids per-message Arena init/deinit (major hot-path cost).
+    msg_arena: std.heap.ArenaAllocator,
 
     pub fn connect(io: Io, allocator: std.mem.Allocator, config: Config) !NatsClient {
         const peer = try net.IpAddress.parse(config.host, config.port);
         const stream = try peer.connect(io, .{ .mode = .stream });
         errdefer stream.close(io);
 
-        // Allocate buffers for TCP stream
-        const r_buf = try allocator.alloc(u8, 8192);
+        // Larger buffers: better batching for ACK/PUB flushes under load.
+        const r_buf = try allocator.alloc(u8, 64 * 1024);
         errdefer allocator.free(r_buf);
 
-        const w_buf = try allocator.alloc(u8, 8192);
+        const w_buf = try allocator.alloc(u8, 64 * 1024);
         errdefer allocator.free(w_buf);
 
         var client = NatsClient{
@@ -54,6 +56,7 @@ pub const NatsClient = struct {
             .connection = undefined,
             .tls_reader_buf = null,
             .tls_writer_buf = null,
+            .msg_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
         if (config.use_tls) {
@@ -162,6 +165,7 @@ pub const NatsClient = struct {
     }
 
     pub fn deinit(self: *NatsClient) void {
+        self.msg_arena.deinit();
         self.stream.close(self.io);
         self.allocator.free(self.reader_buf);
         self.allocator.free(self.writer_buf);
@@ -261,10 +265,9 @@ pub const NatsClient = struct {
         /// True when this is a JetStream status/empty response (404/408/etc).
         is_status: bool,
         status_code: u16,
-        arena: std.heap.ArenaAllocator,
-
+        /// Backing store is NatsClient.msg_arena; deinit is a no-op (arena resets on next readMsg).
         pub fn deinit(self: *Msg) void {
-            self.arena.deinit();
+            _ = self;
         }
 
         pub fn headerGet(self: *const Msg, key: []const u8) ?[]const u8 {
@@ -332,9 +335,9 @@ pub const NatsClient = struct {
     }
 
     pub fn readMsg(self: *NatsClient) !Msg {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
-        const alloc = arena.allocator();
+        // Reuse one arena for the lifetime of the connection (reset per message).
+        _ = self.msg_arena.reset(.retain_capacity);
+        const alloc = self.msg_arena.allocator();
 
         while (true) {
             const line = try self.readLine() orelse return error.ConnectionClosed;
@@ -391,7 +394,6 @@ pub const NatsClient = struct {
                     .delivery_count = if (parsed.delivery_count == 0) 1 else parsed.delivery_count,
                     .is_status = parsed.is_status or payload_buf.len == 0,
                     .status_code = parsed.status_code,
-                    .arena = arena,
                 };
             }
 
@@ -430,7 +432,6 @@ pub const NatsClient = struct {
                     .delivery_count = 1,
                     .is_status = is_status,
                     .status_code = 0,
-                    .arena = arena,
                 };
             }
         }
@@ -498,9 +499,26 @@ pub const NatsClient = struct {
     }
 
     /// Buffer a +ACK without flushing (pair with flush() for batch efficiency).
+    /// Fast path: fixed-format write, no print formatting overhead.
     pub fn ackBuffered(self: *NatsClient, msg: *const Msg) !void {
         if (msg.reply_to) |reply| {
-            try self.publishRaw(reply, null, "+ACK", false);
+            // "PUB <reply> 4\r\n+ACK\r\n"
+            var buf: [256]u8 = undefined;
+            if (reply.len + 16 > buf.len) {
+                try self.publishRaw(reply, null, "+ACK", false);
+                return;
+            }
+            // Build without fmt where possible
+            const prefix = "PUB ";
+            const mid = " 4\r\n+ACK\r\n";
+            var n: usize = 0;
+            @memcpy(buf[n..][0..prefix.len], prefix);
+            n += prefix.len;
+            @memcpy(buf[n..][0..reply.len], reply);
+            n += reply.len;
+            @memcpy(buf[n..][0..mid.len], mid);
+            n += mid.len;
+            try self.getWriter().writeAll(buf[0..n]);
         }
     }
 

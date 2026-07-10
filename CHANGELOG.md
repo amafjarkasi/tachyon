@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Modular source layout: split `worker.zig` into `config`, `resilience`, `job`, `metrics_server`, and `logging` modules
 - Brand assets moved to `assets/` (logos, architecture diagram, logo options)
 - README: real end-to-end usage recipes (hello world, benchmark, Docker, DLQ, custom handler, shutdown)
-- README performance table updated to latest measured hot-path numbers (~62–65k/s peak, full 150k drain)
+- README performance table updated to latest measured peaks (~74–92k/s with single-consumer + arena reuse)
 
 ### Added
 - Expanded `.gitignore` (OS junk, env files, coverage artifacts)
@@ -23,11 +23,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Performance
 - Hot path: no per-job `+WPI`, optional skip JSON, stack `requestNext`
-- ACK flush batching (`ack_flush_every`) — flush every N buffered `+ACK`s, not only end-of-batch
-- Pull prefetch (`pull_prefetch`) — next `requestNext` issued mid-batch to overlap NATS RTT
-- Adaptive pull expires — long when busy (`pull_expires_ns`), short when empty (`pull_expires_empty_ns`)
-- Dedup: open-addressed u64 hash set (no per-id string alloc); overwrite when full; `0` disables
-- Bench: unique job ids; quiet `processJob`; full 150k drain in ~2–3s on local loopback
+- **Reuse `msg_arena`** across `readMsg` (no per-message Arena init/deinit)
+- **64KB** TCP read/write buffers; **fast-path `ackBuffered`** (no fmt)
+- ACK flush batching (`ack_flush_every`, default 128)
+- Pull prefetch (`pull_prefetch`) — next `requestNext` mid-batch
+- Adaptive pull expires — busy vs empty
+- **`single_consumer_mode`** — skip low-priority probe RTT for single-queue / bench
+- Dedup: open-addressed u64 hash set; `0` disables
+- Benchmark producer: buffer publishes and flush every 64
+- Bench: unique job ids; quiet `processJob`
 
 ---
 
