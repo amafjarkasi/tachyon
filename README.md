@@ -1,25 +1,49 @@
 <p align="center">
-  <img src="logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="640" />
-</p>
-
-<p align="center">
-  <strong>Ultra-fast, zero-dependency background jobs in Zig + NATS JetStream</strong><br/>
-  <sub>At-least-once delivery · Priority queues · Retries · DLQ · Metrics · K8s-ready</sub>
+  <img src="logo-banner.png" alt="Tachyon — Zero-dep job processor · Zig 0.16 · NATS JetStream" width="720" />
 </p>
 
 <p align="center">
   <a href="https://github.com/amafjarkasi/tachyon/actions/workflows/ci.yml"><img src="https://github.com/amafjarkasi/tachyon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/amafjarkasi/tachyon/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-green" alt="v0.2.0"></a>
-  <a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig" alt="Zig 0.16.0"></a>
-  <a href="https://docs.nats.io/nats-concepts/jetstream"><img src="https://img.shields.io/badge/NATS-JetStream-27aae1" alt="NATS JetStream"></a>
+  <a href="https://github.com/amafjarkasi/tachyon/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-brightgreen" alt="v0.2.0"></a>
+  <a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white" alt="Zig 0.16.0"></a>
+  <a href="https://docs.nats.io/nats-concepts/jetstream"><img src="https://img.shields.io/badge/NATS-JetStream-27aae1?logo=natsdotio&logoColor=white" alt="NATS JetStream"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-Keep%20a%20Changelog-orange" alt="Changelog"></a>
+  <a href="https://github.com/amafjarkasi/tachyon/stargazers"><img src="https://img.shields.io/github/stars/amafjarkasi/tachyon?style=flat" alt="Stars"></a>
 </p>
 
+# Tachyon
+
+**Tachyon** is a zero-dependency, ultra-high-performance **background job processing library** built natively in **Zig 0.16.0** and powered by the **NATS JetStream** protocol. Engineered for low-latency, mission-critical systems — financial transaction processors, telemetry ingest engines, notification pipelines, and microsecond-sensitive microservices — Tachyon completely bypasses heavy runtime engines, garbage collectors (GC), and third-party frameworks.
+
+It speaks raw NATS over a hand-rolled TCP/TLS client, pulls work through durable JetStream consumers, and runs a multi-threaded worker pool with **per-thread socket isolation**, **zero-allocation arena reuse**, and production ops endpoints (`/health`, Prometheus `/metrics`).
+
+### Why Tachyon?
+
+*   **The Zig Edge:** Precise control over memory and native target compilation give deterministic, bare-metal runtime execution. There are no heap allocations on the hot path — no GC pauses, no runtime surprises.
+*   **NATS JetStream Power:** Instead of heavy polling or external databases as queues, Tachyon uses JetStream’s durable streams, wildcard routing, and pull-based consumers for at-least-once delivery with explicit ACK / NAK.
+*   **Engineered for Speed:** Worker-isolated sockets (no mutex on the hot path) and reusable arenas deliver peak consumption near **100,000 jobs per second** while holding a flat memory profile under **5 MB** at full load.
+*   **Production Resilience (v0.2):** Exponential-backoff retries, JetStream-backed DLQ, circuit breaker, soft job timeouts, in-process dedup, buffered batch ACK, HMSG headers with real delivery counts, and graceful SIGINT/SIGTERM drain.
+
+### At a glance
+
+| Need | How Tachyon delivers |
+| :--- | :--- |
+| Extreme throughput | ~**99k jobs/sec** consume · ~**72k/sec** produce (local loopback benchmarks) |
+| Tiny memory | **&lt; 1 MB** idle · **&lt; 5 MB** peak under full load (flat arena reuse) |
+| Reliable delivery | Explicit `+ACK` · **NAK + exponential backoff** · `max_deliver` · **JetStream DLQ** |
+| Correct retries | **HMSG** / `Nats-Delivery-Count` · `+WPI` progress · `+TERM` on exhaust |
+| Ops-ready | `/health` · Prometheus `/metrics` · structured JSON logs · SLA latency warns |
+| Safe restarts | Windows Ctrl+C · POSIX **SIGINT / SIGTERM** graceful worker drain |
+| Flexible deploy | CLI · env · `config.json` · Docker · systemd · Kubernetes |
+
+> **Latest:** [v0.2.0](https://github.com/amafjarkasi/tachyon/releases/tag/v0.2.0) — HMSG headers, real delivery-count retries, soft timeouts, dedup, circuit breaker, buffered batch ACK, auto-created `DEAD_LETTERS` stream. Full notes in [CHANGELOG.md](CHANGELOG.md).
+
 <p align="center">
-  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-quick-start"><strong>Quick Start</strong></a> ·
   <a href="#-features">Features</a> ·
   <a href="#️-architecture">Architecture</a> ·
+  <a href="#-performance">Performance</a> ·
   <a href="#-configuration">Configuration</a> ·
   <a href="#-production">Production</a> ·
   <a href="#-troubleshooting">Troubleshooting</a>
@@ -27,55 +51,14 @@
 
 ---
 
-## What is Tachyon?
-
-**Tachyon** is a production-oriented **background job processor** written in pure **Zig 0.16**, talking to **NATS JetStream** over a hand-rolled TCP/TLS client — **no runtime, no GC, no third-party crates**.
-
-It is built for systems that need:
-
-| Need | How Tachyon delivers |
-| :--- | :--- |
-| Extreme throughput | ~**99k jobs/sec** consume, ~**72k/sec** produce (local loopback benchmarks) |
-| Tiny memory | **&lt; 5 MB** peak under full load; flat arena reuse |
-| Reliable delivery | Explicit ACK, **NAK + exponential backoff**, `max_deliver`, **JetStream DLQ** |
-| Ops-ready | `/health`, Prometheus `/metrics`, SIGINT/SIGTERM drain, structured JSON logs |
-| Flexible deploy | CLI · env · `config.json` · Docker · systemd · Kubernetes |
-
-> **v0.2.0** adds HMSG headers, real delivery-count retries, soft job timeouts, in-process dedup, circuit breaker, buffered batch ACK, and an auto-created `DEAD_LETTERS` stream.
-
----
-
-## Why Tachyon?
-
-```text
-┌──────────────────┬────────────────────────────────────────────────────────┐
-│ Zig edge         │ Deterministic native code, no GC pauses, full control  │
-│ NATS JetStream   │ Durable streams, pull consumers, priority subjects     │
-│ Socket isolation │ One NATS connection per worker thread — zero locks     │
-│ Arena reuse      │ arena.reset(.retain_capacity) on the hot path          │
-│ Zero deps        │ Only the Zig standard library                          │
-└──────────────────┴────────────────────────────────────────────────────────┘
-```
-
-Compared to typical stacks:
-
-| Metric | **Tachyon** | Rust (tokio-nats) | Go (nats.go) | Node (BullMQ) | Python (Celery) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| Max ingest | **71.6k/s** | ~28k/s | ~21k/s | ~7.5k/s | ~1.8k/s |
-| Max consume | **98.8k/s** | ~86k/s | ~65k/s | ~8k/s | ~2k/s |
-| Idle RAM | **&lt; 1 MB** | ~4 MB | ~15 MB | ~74 MB | ~110 MB |
-| Peak RAM | **&lt; 5 MB** | ~12 MB | ~48 MB | ~98 MB | ~145 MB |
-| External deps | **None** | Tokio/Serde… | std | Redis | RabbitMQ + Celery |
-
-*Numbers from local loopback stress tests (500k messages). Your hardware and job handlers will dominate production latency.*
-
----
-
 ## Table of Contents
 
+- [Why Tachyon?](#why-tachyon)
+- [At a glance](#at-a-glance)
 - [Quick Start](#-quick-start)
 - [Features](#-features)
 - [Architecture](#️-architecture)
+- [Performance](#-performance)
 - [Binaries](#-binaries)
 - [Configuration](#-configuration)
 - [Job payload &amp; handler](#-job-payload--handler)
@@ -88,6 +71,31 @@ Compared to typical stacks:
 - [Contributing](#-contributing)
 - [Changelog](#-changelog)
 - [License](#-license)
+
+---
+
+## 🏁 Performance
+
+Compared to typical queue stacks under identical local loopback stress (500k messages):
+
+| Metric | **Tachyon** | Rust (tokio-nats) | Go (nats.go) | Node (BullMQ) | Python (Celery) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Max ingest | **71.6k/s** | ~28k/s | ~21k/s | ~7.5k/s | ~1.8k/s |
+| Max consume | **98.8k/s** | ~86k/s | ~65k/s | ~8k/s | ~2k/s |
+| Idle RAM | **&lt; 1 MB** | ~4 MB | ~15 MB | ~74 MB | ~110 MB |
+| Peak RAM | **&lt; 5 MB** | ~12 MB | ~48 MB | ~98 MB | ~145 MB |
+| Runtime | Native / no GC | Native | Go GC | V8 GC | Interpreter |
+| External deps | **None** | Tokio/Serde… | std | Redis | RabbitMQ + Celery |
+
+### Why it is fast
+
+1. **No garbage collection** — no stop-the-world pauses on the consume path.  
+2. **Arena reuse** — `arena.reset(.retain_capacity)` keeps backing memory warm; near-zero allocator churn.  
+3. **Socket isolation** — each worker thread owns its NATS connection; no shared-socket mutex.  
+4. **Adaptive batching** — pull size shrinks under latency pressure and recovers when healthy.  
+5. **Buffered batch ACK** — optional coalesce of `+ACK` flushes to cut TCP syscalls.
+
+*Benchmarks are local loopback. In production, job-handler I/O (SMTP, HTTP, DB) usually dominates latency — use rate limits, timeouts, and the circuit breaker accordingly.*
 
 ---
 
