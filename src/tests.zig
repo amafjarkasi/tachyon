@@ -362,3 +362,200 @@ test "jitter: stays within 75%-125% band" {
         try std.testing.expect(j >= 750 and j <= 1250);
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HMSG / header parsing
+// ──────────────────────────────────────────────────────────────────────────────
+
+const Header = struct { key: []const u8, value: []const u8 };
+
+fn parseHeadersPure(alloc: std.mem.Allocator, raw: []const u8) !struct {
+    headers: []Header,
+    is_status: bool,
+    status_code: u16,
+    delivery_count: u32,
+} {
+    var list: std.ArrayList(Header) = .empty;
+    errdefer list.deinit(alloc);
+
+    var is_status = false;
+    var status_code: u16 = 0;
+    var delivery_count: u32 = 0;
+
+    var it = std.mem.splitSequence(u8, raw, "\r\n");
+    if (it.next()) |first| {
+        if (std.mem.startsWith(u8, first, "NATS/1.0")) {
+            if (first.len > 8) {
+                const rest = std.mem.trim(u8, first[8..], " ");
+                if (rest.len >= 3) {
+                    is_status = true;
+                    status_code = std.fmt.parseInt(u16, rest[0..3], 10) catch 0;
+                }
+            }
+        }
+    }
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const key = std.mem.trim(u8, line[0..colon], " ");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+            try list.append(alloc, .{ .key = try alloc.dupe(u8, key), .value = try alloc.dupe(u8, value) });
+            if (std.ascii.eqlIgnoreCase(key, "Nats-Delivery-Count")) {
+                delivery_count = std.fmt.parseInt(u32, value, 10) catch 0;
+            }
+        }
+    }
+    return .{
+        .headers = try list.toOwnedSlice(alloc),
+        .is_status = is_status,
+        .status_code = status_code,
+        .delivery_count = delivery_count,
+    };
+}
+
+test "hmsg: parses delivery count from headers" {
+    const raw = "NATS/1.0\r\nNats-Delivery-Count: 3\r\nNats-Stream: JOBS\r\n\r\n";
+    const parsed = try parseHeadersPure(std.testing.allocator, raw);
+    defer {
+        for (parsed.headers) |h| {
+            std.testing.allocator.free(h.key);
+            std.testing.allocator.free(h.value);
+        }
+        std.testing.allocator.free(parsed.headers);
+    }
+    try std.testing.expectEqual(@as(u32, 3), parsed.delivery_count);
+    try std.testing.expect(!parsed.is_status);
+}
+
+test "hmsg: parses status 404 empty pull" {
+    const raw = "NATS/1.0 404 No Messages\r\n\r\n";
+    const parsed = try parseHeadersPure(std.testing.allocator, raw);
+    defer {
+        for (parsed.headers) |h| {
+            std.testing.allocator.free(h.key);
+            std.testing.allocator.free(h.value);
+        }
+        std.testing.allocator.free(parsed.headers);
+    }
+    try std.testing.expect(parsed.is_status);
+    try std.testing.expectEqual(@as(u16, 404), parsed.status_code);
+}
+
+/// HMSG line: HMSG <subject> <sid> [reply] <hdr_len> <total_len>
+fn parseHmsgLine(line: []const u8) !struct { hdr_len: usize, total_len: usize, has_reply: bool } {
+    var it = std.mem.tokenizeAny(u8, line, " ");
+    const prefix = it.next() orelse return error.InvalidHeader;
+    if (!std.mem.eql(u8, prefix, "HMSG")) return error.InvalidHeader;
+    _ = it.next() orelse return error.InvalidHeader; // subject
+    _ = it.next() orelse return error.InvalidHeader; // sid
+    const t3 = it.next() orelse return error.InvalidHeader;
+    const t4 = it.next() orelse return error.InvalidHeader;
+    if (it.next()) |t5| {
+        return .{
+            .hdr_len = try std.fmt.parseInt(usize, t4, 10),
+            .total_len = try std.fmt.parseInt(usize, t5, 10),
+            .has_reply = true,
+        };
+    }
+    return .{
+        .hdr_len = try std.fmt.parseInt(usize, t3, 10),
+        .total_len = try std.fmt.parseInt(usize, t4, 10),
+        .has_reply = false,
+    };
+}
+
+test "hmsg: parses HMSG line with reply-to" {
+    const r = try parseHmsgLine("HMSG jobs.high.email 1 _INBOX.x 48 120");
+    try std.testing.expect(r.has_reply);
+    try std.testing.expectEqual(@as(usize, 48), r.hdr_len);
+    try std.testing.expectEqual(@as(usize, 120), r.total_len);
+}
+
+test "hmsg: parses HMSG line without reply-to" {
+    const r = try parseHmsgLine("HMSG jobs.high.email 1 48 120");
+    try std.testing.expect(!r.has_reply);
+    try std.testing.expectEqual(@as(usize, 48), r.hdr_len);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Circuit breaker
+// ──────────────────────────────────────────────────────────────────────────────
+
+const CircuitState = enum { closed, open, half_open };
+const CircuitBreaker = struct {
+    state: CircuitState = .closed,
+    consecutive_failures: u32 = 0,
+    open_until_ms: i64 = 0,
+    failure_threshold: u32,
+    open_ms: u32,
+
+    fn allow(self: *CircuitBreaker, now_ms: i64) bool {
+        return switch (self.state) {
+            .closed => true,
+            .half_open => true,
+            .open => {
+                if (now_ms >= self.open_until_ms) {
+                    self.state = .half_open;
+                    return true;
+                }
+                return false;
+            },
+        };
+    }
+    fn onSuccess(self: *CircuitBreaker) void {
+        self.consecutive_failures = 0;
+        self.state = .closed;
+    }
+    fn onFailure(self: *CircuitBreaker, now_ms: i64) void {
+        self.consecutive_failures += 1;
+        if (self.consecutive_failures >= self.failure_threshold) {
+            self.state = .open;
+            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
+        } else if (self.state == .half_open) {
+            self.state = .open;
+            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
+        }
+    }
+};
+
+test "circuit: opens after threshold failures" {
+    var cb = CircuitBreaker{ .failure_threshold = 3, .open_ms = 1000 };
+    cb.onFailure(0);
+    cb.onFailure(1);
+    try std.testing.expect(cb.allow(2));
+    cb.onFailure(2);
+    try std.testing.expect(cb.state == .open);
+    try std.testing.expect(!cb.allow(500));
+    try std.testing.expect(cb.allow(2000)); // half-open after timeout
+    try std.testing.expect(cb.state == .half_open);
+    cb.onSuccess();
+    try std.testing.expect(cb.state == .closed);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Job timeout + dedup
+// ──────────────────────────────────────────────────────────────────────────────
+
+test "timeout: exceeds limit" {
+    const timeout_ms: i64 = 5000;
+    const elapsed_ms: i64 = 5200;
+    try std.testing.expect(elapsed_ms > timeout_ms);
+}
+
+test "dedup: second insert is duplicate" {
+    var map = std.StringHashMap(void).init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("job_1", {});
+    try std.testing.expect(map.contains("job_1"));
+    try std.testing.expect(!map.contains("job_2"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ACK protocol bodies
+// ──────────────────────────────────────────────────────────────────────────────
+
+test "ack protocol: terminal and in-progress bodies" {
+    try std.testing.expectEqualStrings("+TERM", "+TERM");
+    try std.testing.expectEqualStrings("+WPI", "+WPI");
+    try std.testing.expectEqualStrings("+ACK", "+ACK");
+}

@@ -114,6 +114,30 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 *   **How it works:** On connection failure, workers use exponential reconnect backoff (1s → 30s cap) with ±25% LCG jitter so threads do not reconnect in lockstep after a NATS bounce.
 *   **Benefit:** Avoids thundering-herd reconnect storms against recovering brokers.
 
+### 17. NATS Headers (HMSG / HPUB)
+*   **How it works:** `readMsg` understands both classic `MSG` and header-bearing `HMSG` frames. JetStream metadata such as `Nats-Delivery-Count` is parsed into `Msg.delivery_count`. Producers can call `publishWithHeaders` (HPUB) to attach `Nats-Msg-Id` and other headers.
+*   **Benefit:** Enables correct retry attempt tracking, broker-side dedup hooks, and status-frame detection without treating headers as payload.
+
+### 18. Soft Per-Job Timeout
+*   **How it works:** Each job is timed with `std.Io.Timestamp`. When `job_timeout_ms` is exceeded, the worker NACKs the message for redelivery. Long-running handlers also emit `+WPI` (in-progress) to extend JetStream `ack_wait`.
+*   **Benefit:** Prevents silent worker stalls from permanently starving a pull slot. (Note: truly blocking native calls still need `ack_wait` / external cancellation.)
+
+### 19. Job Deduplication (Idempotency)
+*   **How it works:** Successfully processed `job.id` values are recorded in a per-thread bounded hash map (`dedup_cache_size`). Duplicates are ACKed without re-running the handler. Producers also set `Nats-Msg-Id` for optional broker-side dedup.
+*   **Benefit:** At-least-once delivery becomes effectively exactly-once for handlers that key work by `job.id`.
+
+### 20. Circuit Breaker
+*   **How it works:** After `circuit_failure_threshold` consecutive handler failures, the worker opens the circuit for `circuit_open_ms`, NACKing new jobs without invoking the handler. After the open window it enters half-open and probes one job.
+*   **Benefit:** Fast-fails when a downstream dependency is down, reducing thundering load and log noise.
+
+### 21. Buffered Batch ACK
+*   **How it works:** When `batch_ack` is true, successful jobs write `+ACK` frames without flushing; a single `flushWrites()` runs at the end of each pull batch.
+*   **Benefit:** Fewer TCP syscalls under high throughput while preserving per-message explicit ACK semantics.
+
+### 22. JetStream-Backed DLQ
+*   **How it works:** At startup the worker creates stream `DEAD_LETTERS` (configurable via `dlq_stream`) with subject filter `jobs.failed` (configurable via `dlq_subject`). Poison messages and exhausted retries are published there and terminated with `+TERM`.
+*   **Benefit:** Failed jobs are durable and inspectable without a manual `nats stream add` step.
+
 ---
 
 ## 🏗️ System Architecture
@@ -612,11 +636,17 @@ Deploy a `config.json` in your working directory:
     "subject_high": "jobs.high.*",
     "subject_low": "jobs.low.*",
     "dlq_subject": "jobs.failed",
+    "dlq_stream": "DEAD_LETTERS",
     "max_deliver": 5,
     "retry_base_ms": 1000,
     "retry_max_ms": 30000,
     "job_ttl_seconds": 0,
-    "max_jobs_per_second": 0
+    "max_jobs_per_second": 0,
+    "job_timeout_ms": 5000,
+    "dedup_cache_size": 10000,
+    "circuit_failure_threshold": 10,
+    "circuit_open_ms": 5000,
+    "batch_ack": true
 }
 ```
 
@@ -626,10 +656,16 @@ Deploy a `config.json` in your working directory:
 | `consumer_high` / `consumer_low` | `WORKER_HIGH` / `WORKER_LOW` | Durable pull consumer names |
 | `subject_high` / `subject_low` | `jobs.high.*` / `jobs.low.*` | Subject filters for priority routing |
 | `dlq_subject` | `jobs.failed` | Subject used for poison-message DLQ publishes |
+| `dlq_stream` | `DEAD_LETTERS` | JetStream stream created for the DLQ subject |
 | `max_deliver` | `5` | JetStream max redeliveries before stop |
 | `retry_base_ms` / `retry_max_ms` | `1000` / `30000` | Exponential NAK backoff range |
 | `job_ttl_seconds` | `0` | Stream `max_age` in seconds (`0` = none) |
 | `max_jobs_per_second` | `0` | Per-worker rate cap (`0` = unlimited) |
+| `job_timeout_ms` | `5000` | Soft per-job wall-clock timeout (`0` = off) |
+| `dedup_cache_size` | `10000` | Per-thread max remembered `job.id` values |
+| `circuit_failure_threshold` | `10` | Consecutive failures before circuit opens |
+| `circuit_open_ms` | `5000` | How long the circuit stays open |
+| `batch_ack` | `true` | Buffer `+ACK` frames and flush once per batch |
 
 ### Environment Variable Overrides
 All config fields can be overridden by setting the following environment variables before launching the worker binary:
@@ -648,9 +684,11 @@ All config fields can be overridden by setting the following environment variabl
 | `SUBJECT_HIGH` | `string` | `orders.high.*` | High-priority subject filter |
 | `SUBJECT_LOW` | `string` | `orders.low.*` | Low-priority subject filter |
 | `DLQ_SUBJECT` | `string` | `orders.failed` | Dead-letter subject |
+| `DLQ_STREAM` | `string` | `DEAD_LETTERS` | JetStream stream for the DLQ |
 | `MAX_DELIVER` | `integer` | `5` | Max JetStream redeliveries |
 | `JOB_TTL_SECONDS` | `integer` | `86400` | Stream message TTL in seconds |
 | `MAX_JOBS_PER_SECOND` | `integer` | `100` | Per-worker rate limit |
+| `JOB_TIMEOUT_MS` | `integer` | `5000` | Soft per-job timeout in milliseconds |
 
 ### CLI Flag Reference
 Flags are parsed last and override all other configuration sources:

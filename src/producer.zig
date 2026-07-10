@@ -56,6 +56,10 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(payload);
 
     std.debug.print("Enqueueing job: {s}\n", .{my_job.id});
-    try client.publish("jobs.high.email", null, payload);
+    // HPUB with Nats-Msg-Id enables broker-side dedup when stream is configured for it;
+    // workers also dedupe in-process by job.id.
+    var id_hdr_buf: [64]u8 = undefined;
+    const id_hdr = try std.fmt.bufPrint(&id_hdr_buf, "Nats-Msg-Id: {s}", .{my_job.id});
+    try client.publishWithHeaders("jobs.high.email", null, &[_][]const u8{id_hdr}, payload);
     std.debug.print("Job enqueued successfully!\n", .{});
 }

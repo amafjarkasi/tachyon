@@ -188,12 +188,54 @@ pub const NatsClient = struct {
     }
 
     pub fn publish(self: *NatsClient, subject: []const u8, reply_to: ?[]const u8, payload: []const u8) !void {
+        try self.publishRaw(subject, reply_to, payload, true);
+    }
+
+    /// Write a PUB frame; when `do_flush` is false the caller must flush later (batch ACK).
+    pub fn publishRaw(self: *NatsClient, subject: []const u8, reply_to: ?[]const u8, payload: []const u8, do_flush: bool) !void {
         const w = self.getWriter();
         if (reply_to) |reply| {
             try w.print("PUB {s} {s} {d}\r\n{s}\r\n", .{ subject, reply, payload.len, payload });
         } else {
             try w.print("PUB {s} {d}\r\n{s}\r\n", .{ subject, payload.len, payload });
         }
+        if (do_flush) try w.flush();
+    }
+
+    /// Publish with NATS headers (HPUB). `headers` is a list of "Key: Value" lines (no trailing CRLF).
+    pub fn publishWithHeaders(self: *NatsClient, subject: []const u8, reply_to: ?[]const u8, headers: []const []const u8, payload: []const u8) !void {
+        var hdr_buf: [1024]u8 = undefined;
+        var hdr_len: usize = 0;
+        // NATS/1.0\r\n
+        const version = "NATS/1.0\r\n";
+        @memcpy(hdr_buf[hdr_len..][0..version.len], version);
+        hdr_len += version.len;
+        for (headers) |h| {
+            if (hdr_len + h.len + 2 >= hdr_buf.len) return error.HeadersTooLarge;
+            @memcpy(hdr_buf[hdr_len..][0..h.len], h);
+            hdr_len += h.len;
+            hdr_buf[hdr_len] = '\r';
+            hdr_len += 1;
+            hdr_buf[hdr_len] = '\n';
+            hdr_len += 1;
+        }
+        // trailing blank line
+        if (hdr_len + 2 >= hdr_buf.len) return error.HeadersTooLarge;
+        hdr_buf[hdr_len] = '\r';
+        hdr_len += 1;
+        hdr_buf[hdr_len] = '\n';
+        hdr_len += 1;
+
+        const total = hdr_len + payload.len;
+        const w = self.getWriter();
+        if (reply_to) |reply| {
+            try w.print("HPUB {s} {s} {d} {d}\r\n", .{ subject, reply, hdr_len, total });
+        } else {
+            try w.print("HPUB {s} {d} {d}\r\n", .{ subject, hdr_len, total });
+        }
+        try w.writeAll(hdr_buf[0..hdr_len]);
+        try w.writeAll(payload);
+        try w.writeAll("\r\n");
         try w.flush();
     }
 
@@ -203,17 +245,91 @@ pub const NatsClient = struct {
         try w.flush();
     }
 
+    pub const Header = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     pub const Msg = struct {
         subject: []const u8,
         sid: []const u8,
         reply_to: ?[]const u8,
         payload: []const u8,
+        headers: []Header,
+        /// JetStream Nats-Delivery-Count (1 on first delivery). 0 if absent.
+        delivery_count: u32,
+        /// True when this is a JetStream status/empty response (404/408/etc).
+        is_status: bool,
+        status_code: u16,
         arena: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *Msg) void {
             self.arena.deinit();
         }
+
+        pub fn headerGet(self: *const Msg, key: []const u8) ?[]const u8 {
+            for (self.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.key, key)) return h.value;
+            }
+            return null;
+        }
     };
+
+    fn readExact(self: *NatsClient, buf: []u8) !void {
+        switch (self.connection) {
+            .plain => |*p| try p.reader.interface.readSliceAll(buf),
+            .tls => |*t| try t.client.reader.readSliceAll(buf),
+        }
+    }
+
+    fn takeCrLf(self: *NatsClient) !void {
+        var crlf: [2]u8 = undefined;
+        try self.readExact(&crlf);
+    }
+
+    /// Parse NATS header block into Header slice on `alloc`. Also extracts status line.
+    fn parseHeaders(alloc: std.mem.Allocator, raw: []const u8) !struct { headers: []Header, is_status: bool, status_code: u16, delivery_count: u32 } {
+        var list: std.ArrayList(Header) = .empty;
+        errdefer list.deinit(alloc);
+
+        var is_status = false;
+        var status_code: u16 = 0;
+        var delivery_count: u32 = 0;
+
+        var it = std.mem.splitSequence(u8, raw, "\r\n");
+        if (it.next()) |first| {
+            // "NATS/1.0" or "NATS/1.0 404 No Messages"
+            if (std.mem.startsWith(u8, first, "NATS/1.0")) {
+                if (first.len > 8) {
+                    const rest = std.mem.trim(u8, first[8..], " ");
+                    if (rest.len >= 3) {
+                        is_status = true;
+                        status_code = std.fmt.parseInt(u16, rest[0..3], 10) catch 0;
+                    }
+                }
+            }
+        }
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+                const key = std.mem.trim(u8, line[0..colon], " ");
+                const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+                const k = try alloc.dupe(u8, key);
+                const v = try alloc.dupe(u8, value);
+                try list.append(alloc, .{ .key = k, .value = v });
+                if (std.ascii.eqlIgnoreCase(key, "Nats-Delivery-Count")) {
+                    delivery_count = std.fmt.parseInt(u32, value, 10) catch 0;
+                }
+            }
+        }
+
+        return .{
+            .headers = try list.toOwnedSlice(alloc),
+            .is_status = is_status,
+            .status_code = status_code,
+            .delivery_count = delivery_count,
+        };
+    }
 
     pub fn readMsg(self: *NatsClient) !Msg {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -233,6 +349,50 @@ pub const NatsClient = struct {
             if (std.mem.startsWith(u8, line, "-ERR")) {
                 std.debug.print("NATS Error: {s}\n", .{line});
                 return error.NatsServerError;
+            }
+
+            if (std.mem.startsWith(u8, line, "HMSG")) {
+                // HMSG <subject> <sid> [reply-to] <hdr_len> <total_len>
+                var it = std.mem.tokenizeAny(u8, line, " ");
+                _ = it.next(); // HMSG
+                const subject = try alloc.dupe(u8, it.next() orelse return error.InvalidMsgFormat);
+                const sid = try alloc.dupe(u8, it.next() orelse return error.InvalidMsgFormat);
+
+                const t3 = it.next() orelse return error.InvalidMsgFormat;
+                const t4 = it.next() orelse return error.InvalidMsgFormat;
+                var reply_to: ?[]const u8 = null;
+                var hdr_len: usize = undefined;
+                var total_len: usize = undefined;
+
+                if (it.next()) |t5| {
+                    reply_to = try alloc.dupe(u8, t3);
+                    hdr_len = try std.fmt.parseInt(usize, t4, 10);
+                    total_len = try std.fmt.parseInt(usize, t5, 10);
+                } else {
+                    hdr_len = try std.fmt.parseInt(usize, t3, 10);
+                    total_len = try std.fmt.parseInt(usize, t4, 10);
+                }
+                if (hdr_len > total_len) return error.InvalidMsgFormat;
+
+                const body = try alloc.alloc(u8, total_len);
+                try self.readExact(body);
+                try self.takeCrLf();
+
+                const hdr_raw = body[0..hdr_len];
+                const payload_buf = body[hdr_len..];
+                const parsed = try parseHeaders(alloc, hdr_raw);
+
+                return Msg{
+                    .subject = subject,
+                    .sid = sid,
+                    .reply_to = reply_to,
+                    .payload = payload_buf,
+                    .headers = parsed.headers,
+                    .delivery_count = if (parsed.delivery_count == 0) 1 else parsed.delivery_count,
+                    .is_status = parsed.is_status or payload_buf.len == 0,
+                    .status_code = parsed.status_code,
+                    .arena = arena,
+                };
             }
 
             if (std.mem.startsWith(u8, line, "MSG")) {
@@ -255,24 +415,21 @@ pub const NatsClient = struct {
                 const size = try std.fmt.parseInt(usize, size_str, 10);
 
                 const payload_buf = try alloc.alloc(u8, size);
-                switch (self.connection) {
-                    .plain => |*p| {
-                        try p.reader.interface.readSliceAll(payload_buf);
-                        _ = try p.reader.interface.takeByte();
-                        _ = try p.reader.interface.takeByte();
-                    },
-                    .tls => |*t| {
-                        try t.client.reader.readSliceAll(payload_buf);
-                        _ = try t.client.reader.takeByte();
-                        _ = try t.client.reader.takeByte();
-                    },
-                }
+                try self.readExact(payload_buf);
+                try self.takeCrLf();
+
+                // Legacy status-without-headers: payload starts with NATS/1.0
+                const is_status = std.mem.startsWith(u8, payload_buf, "NATS/1.0") or size == 0;
 
                 return Msg{
                     .subject = subject,
                     .sid = sid,
                     .reply_to = reply_to,
                     .payload = payload_buf,
+                    .headers = &[_]Header{},
+                    .delivery_count = 1,
+                    .is_status = is_status,
+                    .status_code = 0,
                     .arena = arena,
                 };
             }
@@ -335,7 +492,28 @@ pub const NatsClient = struct {
 
     pub fn ack(self: *NatsClient, msg: *const Msg) !void {
         if (msg.reply_to) |reply| {
-            try self.publish(reply, null, "+ACK");
+            try self.publishRaw(reply, null, "+ACK", true);
+        }
+    }
+
+    /// Buffer a +ACK without flushing (pair with flush() for batch efficiency).
+    pub fn ackBuffered(self: *NatsClient, msg: *const Msg) !void {
+        if (msg.reply_to) |reply| {
+            try self.publishRaw(reply, null, "+ACK", false);
+        }
+    }
+
+    /// Terminal ACK: do not redeliver (used when max attempts exhausted → after DLQ).
+    pub fn term(self: *NatsClient, msg: *const Msg) !void {
+        if (msg.reply_to) |reply| {
+            try self.publish(reply, null, "+TERM");
+        }
+    }
+
+    /// In-progress ACK (extends ack_wait) — used by long-running jobs / progress.
+    pub fn inProgress(self: *NatsClient, msg: *const Msg) !void {
+        if (msg.reply_to) |reply| {
+            try self.publish(reply, null, "+WPI");
         }
     }
 
@@ -351,6 +529,19 @@ pub const NatsClient = struct {
                 try self.publish(reply, null, "-NAK");
             }
         }
+    }
+
+    /// Batch ACK helper: buffer +ACK for each message, then one flush.
+    pub fn ackBatch(self: *NatsClient, messages: []const *const Msg) !void {
+        for (messages) |msg| {
+            try self.ackBuffered(msg);
+        }
+        try self.getWriter().flush();
+    }
+
+    /// Flush the write buffer only (no PING round-trip).
+    pub fn flushWrites(self: *NatsClient) !void {
+        try self.getWriter().flush();
     }
 
     pub fn flush(self: *NatsClient) !void {

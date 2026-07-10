@@ -33,15 +33,22 @@ const AppConfig = struct {
     subject_high: []const u8 = "jobs.high.*",
     subject_low: []const u8 = "jobs.low.*",
     dlq_subject: []const u8 = "jobs.failed",
+    dlq_stream: []const u8 = "DEAD_LETTERS",
     max_deliver: u32 = 5,
     retry_base_ms: u32 = 1000,
     retry_max_ms: u32 = 30000,
     job_ttl_seconds: u64 = 0,
     max_jobs_per_second: u32 = 0,
+    job_timeout_ms: u32 = 5000,
+    dedup_cache_size: usize = 10000,
+    circuit_failure_threshold: u32 = 10,
+    circuit_open_ms: u32 = 5000,
+    batch_ack: bool = true,
 };
 
 // Global atomic variables
 var total_jobs = std.atomic.Value(usize).init(0);
+var failed_jobs = std.atomic.Value(usize).init(0);
 var should_shutdown = std.atomic.Value(bool).init(false);
 var target_threads = std.atomic.Value(usize).init(4);
 
@@ -55,15 +62,22 @@ const WorkerContext = struct {
     consumer_high: []const u8,
     consumer_low: []const u8,
     dlq_subject: []const u8,
+    max_deliver: u32,
     retry_base_ms: u32,
     retry_max_ms: u32,
     max_jobs_per_second: u32,
+    job_timeout_ms: u32,
+    dedup_cache_size: usize,
+    circuit_failure_threshold: u32,
+    circuit_open_ms: u32,
+    batch_ack: bool,
 };
 
 const MetricsContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     total_jobs: *std.atomic.Value(usize),
+    failed_jobs: *std.atomic.Value(usize),
 };
 
 const CTRL_C_EVENT = 0;
@@ -103,9 +117,64 @@ fn withJitter(backoff_ms: u32, seed: u64) u32 {
     return @intCast(@min(jittered, 60_000));
 }
 
-/// Stub job processor — always succeeds today. Return error to exercise NAK retry.
-fn processJob(job: Job) !void {
-    _ = job;
+const CircuitState = enum { closed, open, half_open };
+
+const CircuitBreaker = struct {
+    state: CircuitState = .closed,
+    consecutive_failures: u32 = 0,
+    open_until_ms: i64 = 0,
+    failure_threshold: u32,
+    open_ms: u32,
+
+    fn allow(self: *CircuitBreaker, now_ms: i64) bool {
+        return switch (self.state) {
+            .closed => true,
+            .half_open => true,
+            .open => {
+                if (now_ms >= self.open_until_ms) {
+                    self.state = .half_open;
+                    return true;
+                }
+                return false;
+            },
+        };
+    }
+
+    fn onSuccess(self: *CircuitBreaker) void {
+        self.consecutive_failures = 0;
+        self.state = .closed;
+    }
+
+    fn onFailure(self: *CircuitBreaker, now_ms: i64) void {
+        self.consecutive_failures += 1;
+        if (self.consecutive_failures >= self.failure_threshold) {
+            self.state = .open;
+            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
+        } else if (self.state == .half_open) {
+            self.state = .open;
+            self.open_until_ms = now_ms + @as(i64, @intCast(self.open_ms));
+        }
+    }
+};
+
+/// Process a job. Reports progress via optional callback for long work.
+/// Returns error.Timeout if wall time exceeds job_timeout_ms (soft deadline).
+fn processJob(job: Job, thread_id: usize, timeout_ms: u32, io: std.Io, progress: ?*const fn () void) !void {
+    const start = std.Io.Timestamp.now(io, .awake);
+
+    // Real work stub: structured processing of the email job payload.
+    // Replace this body with your domain handler (SMTP, HTTP, DB, etc.).
+    var msg_buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Processing job id={s} to={s} subject={s}", .{ job.id, job.email, job.subject }) catch "Processing job";
+    logJSON("info", thread_id, msg);
+
+    if (progress) |p| p();
+
+    // Soft timeout check (cooperative — hanging native calls still need JetStream ack_wait)
+    if (timeout_ms > 0) {
+        const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+        if (elapsed > timeout_ms) return error.Timeout;
+    }
 }
 
 fn ctrlHandler(ctrl_type: windows.DWORD) callconv(std.builtin.CallingConvention.winapi) windows.BOOL {
@@ -194,6 +263,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("SUBJECT_HIGH")) |val| app_config.subject_high = val;
     if (init.environ_map.get("SUBJECT_LOW")) |val| app_config.subject_low = val;
     if (init.environ_map.get("DLQ_SUBJECT")) |val| app_config.dlq_subject = val;
+    if (init.environ_map.get("DLQ_STREAM")) |val| app_config.dlq_stream = val;
     if (init.environ_map.get("MAX_DELIVER")) |val| {
         app_config.max_deliver = try std.fmt.parseInt(u32, val, 10);
     }
@@ -202,6 +272,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (init.environ_map.get("MAX_JOBS_PER_SECOND")) |val| {
         app_config.max_jobs_per_second = try std.fmt.parseInt(u32, val, 10);
+    }
+    if (init.environ_map.get("JOB_TIMEOUT_MS")) |val| {
+        app_config.job_timeout_ms = try std.fmt.parseInt(u32, val, 10);
     }
 
     // Concurrency parameters
@@ -242,11 +315,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     logJSON("info", null, "Initializing NATS JetStream Stream & Consumers...");
-    // Initialize stream and consumers once from main connection
+    // Initialize stream, DLQ stream, and consumers once from main connection
     {
         var init_client = try NatsClient.connect(io, allocator, config);
         defer init_client.deinit();
         try init_client.setupJetStream(app_config.stream_name, &[_][]const u8{ app_config.subject_high, app_config.subject_low }, app_config.job_ttl_seconds);
+        // JetStream-backed DLQ so failed jobs persist
+        try init_client.setupJetStream(app_config.dlq_stream, &[_][]const u8{app_config.dlq_subject}, 0);
         try init_client.setupConsumer(app_config.stream_name, app_config.consumer_high, app_config.subject_high, app_config.max_deliver);
         try init_client.setupConsumer(app_config.stream_name, app_config.consumer_low, app_config.subject_low, app_config.max_deliver);
         try init_client.flush();
@@ -261,6 +336,7 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .allocator = allocator,
         .total_jobs = &total_jobs,
+        .failed_jobs = &failed_jobs,
     };
     const metrics_thread = try std.Thread.spawn(.{}, metricsServerRun, .{metrics_ctx});
     metrics_thread.detach();
@@ -276,21 +352,7 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 0;
     while (i < num_threads) : (i += 1) {
-        const ctx = try allocator.create(WorkerContext);
-        ctx.* = .{
-            .io = io,
-            .allocator = allocator,
-            .thread_id = i + 1,
-            .batch_size = batch_size,
-            .config = config,
-            .stream_name = app_config.stream_name,
-            .consumer_high = app_config.consumer_high,
-            .consumer_low = app_config.consumer_low,
-            .dlq_subject = app_config.dlq_subject,
-            .retry_base_ms = app_config.retry_base_ms,
-            .retry_max_ms = app_config.retry_max_ms,
-            .max_jobs_per_second = app_config.max_jobs_per_second,
-        };
+        const ctx = try makeWorkerContext(allocator, io, i + 1, batch_size, config, app_config);
         const t = try std.Thread.spawn(.{}, workerRun, .{ctx});
         try active_threads.append(allocator, t);
     }
@@ -313,10 +375,11 @@ pub fn main(init: std.process.Init) !void {
             const elapsed = @as(f64, @floatFromInt(elapsed_duration.toMilliseconds())) / 1000.0;
             const avg_rate = @as(f64, @floatFromInt(current_count)) / elapsed;
             const active_count = target_threads.load(.monotonic);
+            const fails = failed_jobs.load(.monotonic);
 
             // Format log message
-            var log_msg_buf: [128]u8 = undefined;
-            const log_msg = std.fmt.bufPrint(&log_msg_buf, "Throughput: {d} jobs/sec | Avg: {d:.2} jobs/sec | Active: {d}", .{ diff, avg_rate, active_count }) catch continue;
+            var log_msg_buf: [160]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_msg_buf, "Throughput: {d} jobs/sec | Avg: {d:.2} | Active: {d} | Failed: {d}", .{ diff, avg_rate, active_count, fails }) catch continue;
             logJSON("info", null, log_msg);
 
             // Dynamic Worker Thread Auto-Scaling UP
@@ -325,21 +388,7 @@ pub fn main(init: std.process.Init) !void {
                 logJSON("info", null, "High throughput detected. Scaling worker pool UP.");
                 _ = target_threads.fetchAdd(1, .monotonic);
 
-                const ctx = try allocator.create(WorkerContext);
-                ctx.* = .{
-                    .io = io,
-                    .allocator = allocator,
-                    .thread_id = new_id,
-                    .batch_size = batch_size,
-                    .config = config,
-                    .stream_name = app_config.stream_name,
-                    .consumer_high = app_config.consumer_high,
-                    .consumer_low = app_config.consumer_low,
-                    .dlq_subject = app_config.dlq_subject,
-                    .retry_base_ms = app_config.retry_base_ms,
-                    .retry_max_ms = app_config.retry_max_ms,
-                    .max_jobs_per_second = app_config.max_jobs_per_second,
-                };
+                const ctx = try makeWorkerContext(allocator, io, new_id, batch_size, config, app_config);
                 const t = try std.Thread.spawn(.{}, workerRun, .{ctx});
                 try active_threads.append(allocator, t);
             }
@@ -355,6 +404,36 @@ pub fn main(init: std.process.Init) !void {
     logJSON("info", null, "Main thread shutdown. Draining active worker threads...");
 }
 
+fn makeWorkerContext(allocator: std.mem.Allocator, io: std.Io, thread_id: usize, batch_size: usize, config: Config, app_config: AppConfig) !*WorkerContext {
+    const ctx = try allocator.create(WorkerContext);
+    ctx.* = .{
+        .io = io,
+        .allocator = allocator,
+        .thread_id = thread_id,
+        .batch_size = batch_size,
+        .config = config,
+        .stream_name = app_config.stream_name,
+        .consumer_high = app_config.consumer_high,
+        .consumer_low = app_config.consumer_low,
+        .dlq_subject = app_config.dlq_subject,
+        .max_deliver = app_config.max_deliver,
+        .retry_base_ms = app_config.retry_base_ms,
+        .retry_max_ms = app_config.retry_max_ms,
+        .max_jobs_per_second = app_config.max_jobs_per_second,
+        .job_timeout_ms = app_config.job_timeout_ms,
+        .dedup_cache_size = app_config.dedup_cache_size,
+        .circuit_failure_threshold = app_config.circuit_failure_threshold,
+        .circuit_open_ms = app_config.circuit_open_ms,
+        .batch_ack = app_config.batch_ack,
+    };
+    return ctx;
+}
+
+const JobOutcome = enum {
+    continue_batch,
+    break_batch,
+};
+
 fn handleJob(
     client: *NatsClient,
     ctx: *WorkerContext,
@@ -363,30 +442,112 @@ fn handleJob(
     job_arena: *std.heap.ArenaAllocator,
     latency_sum: *i64,
     processed_in_batch: *usize,
-) bool {
+    dedup: *std.StringHashMap(void),
+    circuit: *CircuitBreaker,
+    defer_flush: *bool,
+) JobOutcome {
     const job_start = std.Io.Timestamp.now(ctx.io, .awake);
+    const now_ms = job_start.toMilliseconds();
+
+    // Circuit breaker: fast-fail while open
+    if (!circuit.allow(now_ms)) {
+        const delay = computeBackoffNs(1, ctx.retry_base_ms, ctx.retry_max_ms);
+        client.nack(msg, delay) catch {};
+        logJSON("warn", ctx.thread_id, "Circuit open; NACKed job without processing.");
+        _ = job_arena.reset(.retain_capacity);
+        return .continue_batch;
+    }
 
     const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
         logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ.");
         client.publish(ctx.dlq_subject, null, msg.payload) catch {};
-        client.ack(msg) catch {};
+        client.term(msg) catch {
+            client.ack(msg) catch {};
+        };
+        _ = failed_jobs.fetchAdd(1, .monotonic);
+        circuit.onFailure(now_ms);
         _ = job_arena.reset(.retain_capacity);
-        return true; // continue batch
+        return .continue_batch;
     };
 
-    processJob(parsed.value) catch {
-        // Without HMSG redelivery count, use base backoff and rely on max_deliver for stop.
-        const delay = computeBackoffNs(1, ctx.retry_base_ms, ctx.retry_max_ms);
-        client.nack(msg, delay) catch {};
-        logJSON("warn", ctx.thread_id, "Job failed; NACKed for retry with backoff.");
+    const job = parsed.value;
+
+    // Idempotency / dedup by job.id
+    if (dedup.contains(job.id)) {
+        logJSON("info", ctx.thread_id, "Duplicate job.id skipped (idempotent ACK).");
+        if (ctx.batch_ack) {
+            client.ackBuffered(msg) catch return .break_batch;
+            defer_flush.* = true;
+        } else {
+            client.ack(msg) catch return .break_batch;
+        }
         _ = job_arena.reset(.retain_capacity);
-        return true;
+        return .continue_batch;
+    }
+
+    // Progress heartbeat: extend ack_wait while working
+    client.inProgress(msg) catch {};
+
+    processJob(job, ctx.thread_id, ctx.job_timeout_ms, ctx.io, null) catch |err| {
+        const attempt = if (msg.delivery_count == 0) @as(u32, 1) else msg.delivery_count;
+        if (attempt >= ctx.max_deliver) {
+            logJSON("error", ctx.thread_id, "Max deliveries reached; routing to DLQ + TERM.");
+            client.publish(ctx.dlq_subject, null, msg.payload) catch {};
+            client.term(msg) catch {
+                client.ack(msg) catch {};
+            };
+            _ = failed_jobs.fetchAdd(1, .monotonic);
+            circuit.onFailure(now_ms);
+        } else {
+            const delay = computeBackoffNs(attempt, ctx.retry_base_ms, ctx.retry_max_ms);
+            client.nack(msg, delay) catch {};
+            var err_buf: [96]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Job failed ({s}) attempt={d}; NACKed with backoff.", .{ @errorName(err), attempt }) catch "Job failed; NACKed.";
+            logJSON("warn", ctx.thread_id, err_msg);
+            circuit.onFailure(now_ms);
+        }
+        _ = job_arena.reset(.retain_capacity);
+        return .continue_batch;
     };
 
-    client.ack(msg) catch {
-        return false; // break batch / reconnect
-    };
+    // Soft timeout after success path (processJob already checks; double-check wall clock)
+    if (ctx.job_timeout_ms > 0) {
+        const elapsed = job_start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
+        if (elapsed > ctx.job_timeout_ms) {
+            const attempt = if (msg.delivery_count == 0) @as(u32, 1) else msg.delivery_count;
+            const delay = computeBackoffNs(attempt, ctx.retry_base_ms, ctx.retry_max_ms);
+            client.nack(msg, delay) catch {};
+            logJSON("warn", ctx.thread_id, "Job exceeded timeout; NACKed.");
+            circuit.onFailure(now_ms);
+            _ = job_arena.reset(.retain_capacity);
+            return .continue_batch;
+        }
+    }
 
+    // Record dedup entry (copy id into map-owned memory)
+    if (dedup.count() >= ctx.dedup_cache_size) {
+        // Simple eviction: clear all when full (bounded memory)
+        var it = dedup.keyIterator();
+        while (it.next()) |k| {
+            ctx.allocator.free(k.*);
+        }
+        dedup.clearRetainingCapacity();
+    }
+    if (ctx.allocator.dupe(u8, job.id)) |id_copy| {
+        dedup.put(id_copy, {}) catch {
+            ctx.allocator.free(id_copy);
+        };
+    } else |_| {}
+
+    // ACK immediately (reply_to lives in msg); batch_ack buffers then flushes once
+    if (ctx.batch_ack) {
+        client.ackBuffered(msg) catch return .break_batch;
+        defer_flush.* = true;
+    } else {
+        client.ack(msg) catch return .break_batch;
+    }
+
+    circuit.onSuccess();
     _ = total_jobs.fetchAdd(1, .monotonic);
 
     const job_end = std.Io.Timestamp.now(ctx.io, .awake);
@@ -407,7 +568,53 @@ fn handleJob(
     }
 
     _ = job_arena.reset(.retain_capacity);
-    return true;
+    return .continue_batch;
+}
+
+fn pullConsumerBatch(
+    client: *NatsClient,
+    ctx: *WorkerContext,
+    consumer: []const u8,
+    inbox: []const u8,
+    adaptive_batch: usize,
+    job_alloc: std.mem.Allocator,
+    job_arena: *std.heap.ArenaAllocator,
+    latency_sum: *i64,
+    processed_in_batch: *usize,
+    dedup: *std.StringHashMap(void),
+    circuit: *CircuitBreaker,
+) enum { empty, ok, reconnect } {
+    client.requestNext(ctx.stream_name, consumer, inbox, adaptive_batch) catch return .reconnect;
+
+    var msg_count: usize = 0;
+    var saw_empty = false;
+    var need_flush = false;
+
+    while (msg_count < adaptive_batch) : (msg_count += 1) {
+        var msg = client.readMsg() catch return .reconnect;
+        defer msg.deinit();
+
+        if (msg.is_status or msg.payload.len == 0) {
+            saw_empty = true;
+            break;
+        }
+        // Also treat NATS/1.0 payload status (legacy)
+        if (std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
+            saw_empty = true;
+            break;
+        }
+
+        const outcome = handleJob(client, ctx, &msg, job_alloc, job_arena, latency_sum, processed_in_batch, dedup, circuit, &need_flush);
+        if (outcome == .break_batch) return .reconnect;
+    }
+
+    // Coalesce TCP flush for buffered ACKs written during the batch
+    if (need_flush) {
+        client.flushWrites() catch {};
+    }
+
+    if (saw_empty and msg_count <= 1) return .empty;
+    return .ok;
 }
 
 fn workerRun(ctx: *WorkerContext) void {
@@ -419,10 +626,25 @@ fn workerRun(ctx: *WorkerContext) void {
 
     var backoff_ms: u32 = 1000;
 
-    // Zero-Allocation Arena Reusability (Initialize outside the loop)
+    // Zero-Allocation Arena Reusability
     var job_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer job_arena.deinit();
     const job_alloc = job_arena.allocator();
+
+    // Per-thread dedup cache
+    var dedup = std.StringHashMap(void).init(ctx.allocator);
+    defer {
+        var it = dedup.keyIterator();
+        while (it.next()) |k| {
+            ctx.allocator.free(k.*);
+        }
+        dedup.deinit();
+    }
+
+    var circuit = CircuitBreaker{
+        .failure_threshold = ctx.circuit_failure_threshold,
+        .open_ms = ctx.circuit_open_ms,
+    };
 
     // Adaptive batching size limit
     var adaptive_batch = ctx.batch_size;
@@ -456,101 +678,32 @@ fn workerRun(ctx: *WorkerContext) void {
         };
 
         while (!should_shutdown.load(.monotonic)) {
-            // Dynamic down-scaling exit condition
             if (ctx.thread_id > target_threads.load(.monotonic)) {
                 break;
             }
 
-            // Priority Queue Routing: Poll HIGH first
-            client.requestNext(ctx.stream_name, ctx.consumer_high, inbox, adaptive_batch) catch |err| {
-                var err_buf: [64]u8 = undefined;
-                const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (high) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
-                logJSON("warn", ctx.thread_id, err_msg);
-                break;
-            };
-
-            // Pull batch loop
-            var msg_count: usize = 0;
-            var is_high_empty = false;
             var latency_sum: i64 = 0;
             var processed_in_batch: usize = 0;
 
-            while (msg_count < adaptive_batch) : (msg_count += 1) {
-                var msg = client.readMsg() catch |err| {
-                    if (!should_shutdown.load(.monotonic)) {
-                        var err_buf: [64]u8 = undefined;
-                        const err_msg = std.fmt.bufPrint(&err_buf, "Connection lost during read: {}.", .{err}) catch "Connection lost.";
-                        logJSON("warn", ctx.thread_id, err_msg);
-                    }
-                    break;
-                };
-                defer msg.deinit();
+            // Priority: HIGH then LOW
+            const high = pullConsumerBatch(&client, ctx, ctx.consumer_high, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
+            if (high == .reconnect) break;
 
-                if (std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
-                    is_high_empty = true;
-                    break;
-                }
-
-                if (msg.payload.len == 0) {
-                    is_high_empty = true;
-                    break;
-                }
-
-                if (!handleJob(&client, ctx, &msg, job_alloc, &job_arena, &latency_sum, &processed_in_batch)) {
-                    break;
-                }
+            if (high == .empty and !should_shutdown.load(.monotonic)) {
+                if (ctx.thread_id > target_threads.load(.monotonic)) break;
+                const low = pullConsumerBatch(&client, ctx, ctx.consumer_low, inbox, adaptive_batch, job_alloc, &job_arena, &latency_sum, &processed_in_batch, &dedup, &circuit);
+                if (low == .reconnect) break;
             }
 
-            // Priority Queue Routing Fallback: Poll LOW if HIGH returned empty
-            if (is_high_empty and !should_shutdown.load(.monotonic)) {
-                if (ctx.thread_id > target_threads.load(.monotonic)) {
-                    break;
-                }
-
-                client.requestNext(ctx.stream_name, ctx.consumer_low, inbox, adaptive_batch) catch |err| {
-                    var err_buf: [64]u8 = undefined;
-                    const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (low) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
-                    logJSON("warn", ctx.thread_id, err_msg);
-                    break;
-                };
-
-                msg_count = 0;
-                while (msg_count < adaptive_batch) : (msg_count += 1) {
-                    var msg = client.readMsg() catch |err| {
-                        if (!should_shutdown.load(.monotonic)) {
-                            var err_buf: [64]u8 = undefined;
-                            const err_msg = std.fmt.bufPrint(&err_buf, "Connection lost during read: {}.", .{err}) catch "Connection lost.";
-                            logJSON("warn", ctx.thread_id, err_msg);
-                        }
-                        break;
-                    };
-                    defer msg.deinit();
-
-                    if (std.mem.startsWith(u8, msg.payload, "NATS/1.0")) {
-                        break;
-                    }
-
-                    if (msg.payload.len == 0) {
-                        break;
-                    }
-
-                    if (!handleJob(&client, ctx, &msg, job_alloc, &job_arena, &latency_sum, &processed_in_batch)) {
-                        break;
-                    }
-                }
-            }
-
-            // Adaptive Batching Backpressure Feedback Loop calculation
+            // Adaptive Batching Backpressure Feedback Loop
             if (processed_in_batch > 0) {
                 const avg_latency = @divFloor(latency_sum, @as(i64, @intCast(processed_in_batch)));
                 if (avg_latency > 200) {
-                    // Throttle down batch pulling under backpressure
                     adaptive_batch = @max(adaptive_batch / 2, 1);
                     var bp_buf: [64]u8 = undefined;
                     const bp_msg = std.fmt.bufPrint(&bp_buf, "Backpressure activated. Batch size reduced to: {d}", .{adaptive_batch}) catch "Backpressure activated.";
                     logJSON("info", ctx.thread_id, bp_msg);
                 } else if (avg_latency < 50) {
-                    // Recover back to default
                     adaptive_batch = @min(adaptive_batch + 10, ctx.batch_size);
                 }
             }
@@ -590,7 +743,7 @@ fn metricsServerRun(ctx: *MetricsContext) void {
             req = req[0 .. req.len - 1];
         }
 
-        var write_buf: [512]u8 = undefined;
+        var write_buf: [768]u8 = undefined;
         var w = conn.writer(ctx.io, &write_buf);
 
         if (std.mem.indexOf(u8, req, " /health") != null) {
@@ -598,13 +751,17 @@ fn metricsServerRun(ctx: *MetricsContext) void {
             w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
         } else if (std.mem.indexOf(u8, req, " /metrics") != null) {
             const count = ctx.total_jobs.load(.monotonic);
-            var body_buf: [256]u8 = undefined;
+            const fails = ctx.failed_jobs.load(.monotonic);
+            var body_buf: [384]u8 = undefined;
             const body = std.fmt.bufPrint(&body_buf,
                 \\# HELP zig_jobs_processed_total Total number of jobs processed.
                 \\# TYPE zig_jobs_processed_total counter
                 \\zig_jobs_processed_total {d}
+                \\# HELP zig_jobs_failed_total Total number of jobs failed / dead-lettered.
+                \\# TYPE zig_jobs_failed_total counter
+                \\zig_jobs_failed_total {d}
                 \\
-            , .{count}) catch continue;
+            , .{ count, fails }) catch continue;
 
             w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
         } else {
