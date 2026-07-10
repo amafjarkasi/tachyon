@@ -279,7 +279,9 @@ pub const NatsClient = struct {
         }
     }
 
-    pub fn setupJetStream(self: *NatsClient, stream_name: []const u8, subjects: []const []const u8) !void {
+    /// Create (or overwrite) a JetStream stream.
+    /// `max_age_seconds` of 0 omits message TTL; otherwise sets stream `max_age` in nanoseconds.
+    pub fn setupJetStream(self: *NatsClient, stream_name: []const u8, subjects: []const []const u8, max_age_seconds: u64) !void {
         const js_subject = try std.fmt.allocPrint(self.allocator, "$JS.API.STREAM.CREATE.{s}", .{stream_name});
         defer self.allocator.free(js_subject);
 
@@ -293,21 +295,29 @@ pub const NatsClient = struct {
             try subjects_buf.appendSlice(self.allocator, "\"");
         }
 
-        const payload = try std.fmt.allocPrint(self.allocator,
-            \\{{"name":"{s}","subjects":[{s}]}}
-        , .{ stream_name, subjects_buf.items });
+        const payload = if (max_age_seconds > 0) blk: {
+            const max_age_ns = max_age_seconds * 1_000_000_000;
+            break :blk try std.fmt.allocPrint(self.allocator,
+                \\{{"name":"{s}","subjects":[{s}],"max_age":{d}}}
+            , .{ stream_name, subjects_buf.items, max_age_ns });
+        } else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator,
+                \\{{"name":"{s}","subjects":[{s}]}}
+            , .{ stream_name, subjects_buf.items });
+        };
         defer self.allocator.free(payload);
 
         try self.publish(js_subject, null, payload);
     }
 
-    pub fn setupConsumer(self: *NatsClient, stream_name: []const u8, consumer_name: []const u8, filter_subject: []const u8) !void {
+    /// Create a durable pull consumer with explicit ACK and max redelivery limit.
+    pub fn setupConsumer(self: *NatsClient, stream_name: []const u8, consumer_name: []const u8, filter_subject: []const u8, max_deliver: u32) !void {
         const js_subject = try std.fmt.allocPrint(self.allocator, "$JS.API.CONSUMER.DURABLE.CREATE.{s}.{s}", .{ stream_name, consumer_name });
         defer self.allocator.free(js_subject);
 
         const config_json = try std.fmt.allocPrint(self.allocator,
-            \\{{"stream_name":"{s}","config":{{"durable_name":"{s}","ack_policy":"explicit","filter_subject":"{s}"}}}}
-        , .{ stream_name, consumer_name, filter_subject });
+            \\{{"stream_name":"{s}","config":{{"durable_name":"{s}","ack_policy":"explicit","filter_subject":"{s}","max_deliver":{d},"ack_wait":30000000000}}}}
+        , .{ stream_name, consumer_name, filter_subject, max_deliver });
         defer self.allocator.free(config_json);
 
         try self.publish(js_subject, null, config_json);
@@ -326,6 +336,20 @@ pub const NatsClient = struct {
     pub fn ack(self: *NatsClient, msg: *const Msg) !void {
         if (msg.reply_to) |reply| {
             try self.publish(reply, null, "+ACK");
+        }
+    }
+
+    /// Negative-acknowledge a JetStream message so it can be redelivered.
+    /// If `delay_ns` is non-null, JetStream waits that many nanoseconds before redelivery.
+    pub fn nack(self: *NatsClient, msg: *const Msg, delay_ns: ?u64) !void {
+        if (msg.reply_to) |reply| {
+            if (delay_ns) |d| {
+                var body_buf: [64]u8 = undefined;
+                const body = try std.fmt.bufPrint(&body_buf, "-NAK {{\"delay\":{d}}}", .{d});
+                try self.publish(reply, null, body);
+            } else {
+                try self.publish(reply, null, "-NAK");
+            }
         }
     }
 

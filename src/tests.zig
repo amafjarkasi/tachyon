@@ -119,6 +119,17 @@ const AppConfig = struct {
     nats_ca_path: ?[]const u8 = null,
     worker_threads: usize = 4,
     worker_batch: usize = 50,
+    stream_name: []const u8 = "JOBS",
+    consumer_high: []const u8 = "WORKER_HIGH",
+    consumer_low: []const u8 = "WORKER_LOW",
+    subject_high: []const u8 = "jobs.high.*",
+    subject_low: []const u8 = "jobs.low.*",
+    dlq_subject: []const u8 = "jobs.failed",
+    max_deliver: u32 = 5,
+    retry_base_ms: u32 = 1000,
+    retry_max_ms: u32 = 30000,
+    job_ttl_seconds: u64 = 0,
+    max_jobs_per_second: u32 = 0,
 };
 
 test "config: parses valid config.json structure" {
@@ -128,7 +139,11 @@ test "config: parses valid config.json structure" {
         \\    "nats_port": 4222,
         \\    "nats_tls": true,
         \\    "worker_threads": 8,
-        \\    "worker_batch": 200
+        \\    "worker_batch": 200,
+        \\    "stream_name": "ORDERS",
+        \\    "max_deliver": 10,
+        \\    "job_ttl_seconds": 86400,
+        \\    "max_jobs_per_second": 100
         \\}
     ;
 
@@ -140,6 +155,10 @@ test "config: parses valid config.json structure" {
     try std.testing.expectEqual(true, parsed.value.nats_tls);
     try std.testing.expectEqual(@as(usize, 8), parsed.value.worker_threads);
     try std.testing.expectEqual(@as(usize, 200), parsed.value.worker_batch);
+    try std.testing.expectEqualStrings("ORDERS", parsed.value.stream_name);
+    try std.testing.expectEqual(@as(u32, 10), parsed.value.max_deliver);
+    try std.testing.expectEqual(@as(u64, 86400), parsed.value.job_ttl_seconds);
+    try std.testing.expectEqual(@as(u32, 100), parsed.value.max_jobs_per_second);
 }
 
 test "config: applies defaults for missing fields" {
@@ -152,6 +171,10 @@ test "config: applies defaults for missing fields" {
     try std.testing.expectEqual(false, parsed.value.nats_tls);
     try std.testing.expectEqual(@as(usize, 4), parsed.value.worker_threads);
     try std.testing.expectEqual(@as(usize, 50), parsed.value.worker_batch);
+    try std.testing.expectEqualStrings("JOBS", parsed.value.stream_name);
+    try std.testing.expectEqual(@as(u32, 5), parsed.value.max_deliver);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.job_ttl_seconds);
+    try std.testing.expectEqual(@as(u32, 0), parsed.value.max_jobs_per_second);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -210,4 +233,132 @@ test "sla: no violation below 500ms" {
     const job_latency_ms: i64 = 312;
     const violated = job_latency_ms > sla_limit_ms;
     try std.testing.expect(!violated);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NAK / NACK formatting
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Builds the JetStream NAK body. delay_ns == null → plain "-NAK"
+/// delay_ns set → `-NAK {"delay":<ns>}`
+fn formatNak(buf: []u8, delay_ns: ?u64) ![]const u8 {
+    if (delay_ns) |d| {
+        return try std.fmt.bufPrint(buf, "-NAK {{\"delay\":{d}}}", .{d});
+    }
+    return try std.fmt.bufPrint(buf, "-NAK", .{});
+}
+
+test "nack: plain NAK body" {
+    var buf: [64]u8 = undefined;
+    const body = try formatNak(&buf, null);
+    try std.testing.expectEqualStrings("-NAK", body);
+}
+
+test "nack: delayed NAK body includes nanoseconds" {
+    var buf: [64]u8 = undefined;
+    const body = try formatNak(&buf, 2_000_000_000); // 2 seconds
+    try std.testing.expectEqualStrings("-NAK {\"delay\":2000000000}", body);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Retry exponential backoff
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn computeBackoffNs(attempt: u32, base_ms: u32, max_ms: u32) u64 {
+    var shift: u5 = 0;
+    if (attempt > 1) shift = @intCast(@min(attempt - 1, 16));
+    const raw: u64 = @as(u64, base_ms) << shift;
+    const capped: u64 = @min(raw, @as(u64, max_ms));
+    return capped * 1_000_000;
+}
+
+test "retry backoff: first attempt is base delay" {
+    const ns = computeBackoffNs(1, 1000, 30000);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), ns);
+}
+
+test "retry backoff: doubles each attempt" {
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), computeBackoffNs(2, 1000, 30000));
+    try std.testing.expectEqual(@as(u64, 4_000_000_000), computeBackoffNs(3, 1000, 30000));
+}
+
+test "retry backoff: caps at max_ms" {
+    const ns = computeBackoffNs(20, 1000, 30000);
+    try std.testing.expectEqual(@as(u64, 30_000_000_000), ns);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HTTP path routing (/health, /metrics)
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn routeHttpPath(request_line: []const u8) enum { metrics, health, not_found } {
+    if (std.mem.indexOf(u8, request_line, " /health") != null) return .health;
+    if (std.mem.indexOf(u8, request_line, " /metrics") != null) return .metrics;
+    return .not_found;
+}
+
+test "http route: /health" {
+    try std.testing.expect(routeHttpPath("GET /health HTTP/1.1") == .health);
+}
+
+test "http route: /metrics" {
+    try std.testing.expect(routeHttpPath("GET /metrics HTTP/1.1") == .metrics);
+}
+
+test "http route: unknown" {
+    try std.testing.expect(routeHttpPath("GET /favicon.ico HTTP/1.1") == .not_found);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Job TTL conversion
+// ──────────────────────────────────────────────────────────────────────────────
+
+test "ttl: seconds to nanoseconds" {
+    const seconds: u64 = 86400; // 24h
+    const ns = seconds * 1_000_000_000;
+    try std.testing.expectEqual(@as(u64, 86_400_000_000_000), ns);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Rate limiting
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn rateLimitSleepMs(max_jobs_per_second: u32) u32 {
+    if (max_jobs_per_second == 0) return 0;
+    return @max(1, 1000 / max_jobs_per_second);
+}
+
+test "rate limit: unlimited is zero sleep" {
+    try std.testing.expectEqual(@as(u32, 0), rateLimitSleepMs(0));
+}
+
+test "rate limit: 10/sec is 100ms spacing" {
+    try std.testing.expectEqual(@as(u32, 100), rateLimitSleepMs(10));
+}
+
+test "rate limit: 1000/sec is 1ms spacing" {
+    try std.testing.expectEqual(@as(u32, 1), rateLimitSleepMs(1000));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Reconnect jitter
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn withJitter(backoff_ms: u32, seed: u64) u32 {
+    const span: u64 = 50;
+    const r = (seed *% 1103515245 +% 12345) % (span + 1); // 0..50
+    const pct: u64 = 75 + r; // 75..125
+    const jittered: u64 = (@as(u64, backoff_ms) * pct) / 100;
+    return @intCast(@min(jittered, 60_000));
+}
+
+test "jitter: stays within 75%-125% band" {
+    const base: u32 = 1000;
+    var s: u64 = 1;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const j = withJitter(base, s);
+        s += 1;
+        try std.testing.expect(j >= 750 and j <= 1250);
+    }
 }

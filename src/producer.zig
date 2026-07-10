@@ -29,9 +29,9 @@ pub fn main(init: std.process.Init) !void {
 
     // Setup JetStream stream & consumers
     std.debug.print("Initializing JetStream Stream and Consumers...\n", .{});
-    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" });
-    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*");
-    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*");
+    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" }, 0);
+    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*", 5);
+    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*", 5);
     try client.flush();
 
     // Create a job payload

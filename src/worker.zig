@@ -27,6 +27,17 @@ const AppConfig = struct {
     nats_ca_path: ?[]const u8 = null,
     worker_threads: usize = 4,
     worker_batch: usize = 50,
+    stream_name: []const u8 = "JOBS",
+    consumer_high: []const u8 = "WORKER_HIGH",
+    consumer_low: []const u8 = "WORKER_LOW",
+    subject_high: []const u8 = "jobs.high.*",
+    subject_low: []const u8 = "jobs.low.*",
+    dlq_subject: []const u8 = "jobs.failed",
+    max_deliver: u32 = 5,
+    retry_base_ms: u32 = 1000,
+    retry_max_ms: u32 = 30000,
+    job_ttl_seconds: u64 = 0,
+    max_jobs_per_second: u32 = 0,
 };
 
 // Global atomic variables
@@ -40,6 +51,13 @@ const WorkerContext = struct {
     thread_id: usize,
     batch_size: usize,
     config: Config,
+    stream_name: []const u8,
+    consumer_high: []const u8,
+    consumer_low: []const u8,
+    dlq_subject: []const u8,
+    retry_base_ms: u32,
+    retry_max_ms: u32,
+    max_jobs_per_second: u32,
 };
 
 const MetricsContext = struct {
@@ -60,6 +78,36 @@ fn logJSON(level: []const u8, thread_id: ?usize, msg: []const u8) void {
     }
 }
 
+/// Exponential backoff delay in nanoseconds for JetStream NAK.
+/// attempt is 1-based: delay = min(base_ms * 2^(attempt-1), max_ms) converted to ns.
+fn computeBackoffNs(attempt: u32, base_ms: u32, max_ms: u32) u64 {
+    var shift: u5 = 0;
+    if (attempt > 1) shift = @intCast(@min(attempt - 1, 16));
+    const raw: u64 = @as(u64, base_ms) << shift;
+    const capped: u64 = @min(raw, @as(u64, max_ms));
+    return capped * 1_000_000;
+}
+
+/// Minimum sleep between jobs to enforce max_jobs_per_second. 0 means unlimited.
+fn rateLimitSleepMs(max_jobs_per_second: u32) u32 {
+    if (max_jobs_per_second == 0) return 0;
+    return @max(1, 1000 / max_jobs_per_second);
+}
+
+/// Adds ±25% jitter to backoff_ms using a simple LCG seed.
+fn withJitter(backoff_ms: u32, seed: u64) u32 {
+    const span: u64 = 50;
+    const r = (seed *% 1103515245 +% 12345) % (span + 1); // 0..50
+    const pct: u64 = 75 + r; // 75..125
+    const jittered: u64 = (@as(u64, backoff_ms) * pct) / 100;
+    return @intCast(@min(jittered, 60_000));
+}
+
+/// Stub job processor — always succeeds today. Return error to exercise NAK retry.
+fn processJob(job: Job) !void {
+    _ = job;
+}
+
 fn ctrlHandler(ctrl_type: windows.DWORD) callconv(std.builtin.CallingConvention.winapi) windows.BOOL {
     if (ctrl_type == CTRL_C_EVENT or ctrl_type == CTRL_BREAK_EVENT) {
         logJSON("info", null, "Shutdown signal received. Draining workers gracefully...");
@@ -75,9 +123,26 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Register Win32 Console Handler for graceful shutdown
+    // Register OS signal handlers for graceful shutdown
     if (comptime builtin.target.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(ctrlHandler, .TRUE);
+    } else {
+        const posix = std.posix;
+        const HandlerFn = *align(1) const fn (posix.SIG) callconv(.c) void;
+        const handler: HandlerFn = struct {
+            fn handle(sig: posix.SIG) callconv(.c) void {
+                _ = sig;
+                // async-signal-safe: atomic store only
+                should_shutdown.store(true, .monotonic);
+            }
+        }.handle;
+        const act = posix.Sigaction{
+            .handler = .{ .handler = handler },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.INT, &act, null);
+        posix.sigaction(posix.SIG.TERM, &act, null);
     }
 
     // JSON configuration loader
@@ -122,6 +187,23 @@ pub fn main(init: std.process.Init) !void {
     }
     if (init.environ_map.get("NATS_CA")) |val| config.ca_path = val;
 
+    // Stream / consumer overrides from env
+    if (init.environ_map.get("STREAM_NAME")) |val| app_config.stream_name = val;
+    if (init.environ_map.get("CONSUMER_HIGH")) |val| app_config.consumer_high = val;
+    if (init.environ_map.get("CONSUMER_LOW")) |val| app_config.consumer_low = val;
+    if (init.environ_map.get("SUBJECT_HIGH")) |val| app_config.subject_high = val;
+    if (init.environ_map.get("SUBJECT_LOW")) |val| app_config.subject_low = val;
+    if (init.environ_map.get("DLQ_SUBJECT")) |val| app_config.dlq_subject = val;
+    if (init.environ_map.get("MAX_DELIVER")) |val| {
+        app_config.max_deliver = try std.fmt.parseInt(u32, val, 10);
+    }
+    if (init.environ_map.get("JOB_TTL_SECONDS")) |val| {
+        app_config.job_ttl_seconds = try std.fmt.parseInt(u64, val, 10);
+    }
+    if (init.environ_map.get("MAX_JOBS_PER_SECOND")) |val| {
+        app_config.max_jobs_per_second = try std.fmt.parseInt(u32, val, 10);
+    }
+
     // Concurrency parameters
     var num_threads = app_config.worker_threads;
     var batch_size = app_config.worker_batch;
@@ -164,16 +246,16 @@ pub fn main(init: std.process.Init) !void {
     {
         var init_client = try NatsClient.connect(io, allocator, config);
         defer init_client.deinit();
-        try init_client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" });
-        try init_client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*");
-        try init_client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*");
+        try init_client.setupJetStream(app_config.stream_name, &[_][]const u8{ app_config.subject_high, app_config.subject_low }, app_config.job_ttl_seconds);
+        try init_client.setupConsumer(app_config.stream_name, app_config.consumer_high, app_config.subject_high, app_config.max_deliver);
+        try init_client.setupConsumer(app_config.stream_name, app_config.consumer_low, app_config.subject_low, app_config.max_deliver);
         try init_client.flush();
     }
 
     // Initialize atomic target thread count
     target_threads.store(num_threads, .monotonic);
 
-    // Spawn Prometheus metrics server thread
+    // Spawn Prometheus metrics + health server thread
     const metrics_ctx = try allocator.create(MetricsContext);
     metrics_ctx.* = .{
         .io = io,
@@ -201,6 +283,13 @@ pub fn main(init: std.process.Init) !void {
             .thread_id = i + 1,
             .batch_size = batch_size,
             .config = config,
+            .stream_name = app_config.stream_name,
+            .consumer_high = app_config.consumer_high,
+            .consumer_low = app_config.consumer_low,
+            .dlq_subject = app_config.dlq_subject,
+            .retry_base_ms = app_config.retry_base_ms,
+            .retry_max_ms = app_config.retry_max_ms,
+            .max_jobs_per_second = app_config.max_jobs_per_second,
         };
         const t = try std.Thread.spawn(.{}, workerRun, .{ctx});
         try active_threads.append(allocator, t);
@@ -243,6 +332,13 @@ pub fn main(init: std.process.Init) !void {
                     .thread_id = new_id,
                     .batch_size = batch_size,
                     .config = config,
+                    .stream_name = app_config.stream_name,
+                    .consumer_high = app_config.consumer_high,
+                    .consumer_low = app_config.consumer_low,
+                    .dlq_subject = app_config.dlq_subject,
+                    .retry_base_ms = app_config.retry_base_ms,
+                    .retry_max_ms = app_config.retry_max_ms,
+                    .max_jobs_per_second = app_config.max_jobs_per_second,
                 };
                 const t = try std.Thread.spawn(.{}, workerRun, .{ctx});
                 try active_threads.append(allocator, t);
@@ -257,6 +353,61 @@ pub fn main(init: std.process.Init) !void {
     }
 
     logJSON("info", null, "Main thread shutdown. Draining active worker threads...");
+}
+
+fn handleJob(
+    client: *NatsClient,
+    ctx: *WorkerContext,
+    msg: *const NatsClient.Msg,
+    job_alloc: std.mem.Allocator,
+    job_arena: *std.heap.ArenaAllocator,
+    latency_sum: *i64,
+    processed_in_batch: *usize,
+) bool {
+    const job_start = std.Io.Timestamp.now(ctx.io, .awake);
+
+    const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
+        logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ.");
+        client.publish(ctx.dlq_subject, null, msg.payload) catch {};
+        client.ack(msg) catch {};
+        _ = job_arena.reset(.retain_capacity);
+        return true; // continue batch
+    };
+
+    processJob(parsed.value) catch {
+        // Without HMSG redelivery count, use base backoff and rely on max_deliver for stop.
+        const delay = computeBackoffNs(1, ctx.retry_base_ms, ctx.retry_max_ms);
+        client.nack(msg, delay) catch {};
+        logJSON("warn", ctx.thread_id, "Job failed; NACKed for retry with backoff.");
+        _ = job_arena.reset(.retain_capacity);
+        return true;
+    };
+
+    client.ack(msg) catch {
+        return false; // break batch / reconnect
+    };
+
+    _ = total_jobs.fetchAdd(1, .monotonic);
+
+    const job_end = std.Io.Timestamp.now(ctx.io, .awake);
+    const latency = job_start.durationTo(job_end);
+    const latency_ms = latency.toMilliseconds();
+    latency_sum.* += latency_ms;
+    processed_in_batch.* += 1;
+
+    if (latency_ms > 500) {
+        var lat_buf: [64]u8 = undefined;
+        const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
+        logJSON("warn", ctx.thread_id, lat_msg);
+    }
+
+    if (ctx.max_jobs_per_second > 0) {
+        const sleep_ms = rateLimitSleepMs(ctx.max_jobs_per_second);
+        ctx.io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
+    }
+
+    _ = job_arena.reset(.retain_capacity);
+    return true;
 }
 
 fn workerRun(ctx: *WorkerContext) void {
@@ -283,12 +434,13 @@ fn workerRun(ctx: *WorkerContext) void {
             break;
         }
 
-        // Connect local client with backoff reconnect
+        // Connect local client with backoff reconnect + jitter
         var client = NatsClient.connect(ctx.io, ctx.allocator, ctx.config) catch |err| {
             var err_buf: [64]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "Connection failed: {}. Retrying...", .{err}) catch "Connection failed. Retrying...";
             logJSON("warn", ctx.thread_id, err_msg);
-            ctx.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            const sleep_ms = withJitter(backoff_ms, ctx.thread_id +% backoff_ms);
+            ctx.io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
             backoff_ms = @min(backoff_ms * 2, 30000);
             continue;
         };
@@ -309,8 +461,8 @@ fn workerRun(ctx: *WorkerContext) void {
                 break;
             }
 
-            // Priority Queue Routing: Poll WORKER_HIGH first
-            client.requestNext("JOBS", "WORKER_HIGH", inbox, adaptive_batch) catch |err| {
+            // Priority Queue Routing: Poll HIGH first
+            client.requestNext(ctx.stream_name, ctx.consumer_high, inbox, adaptive_batch) catch |err| {
                 var err_buf: [64]u8 = undefined;
                 const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (high) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
                 logJSON("warn", ctx.thread_id, err_msg);
@@ -344,51 +496,18 @@ fn workerRun(ctx: *WorkerContext) void {
                     break;
                 }
 
-                // Start job execution timing (Latency tracking)
-                const job_start = std.Io.Timestamp.now(ctx.io, .awake);
-
-                // Deserialize payload using the reusable arena allocator
-                const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
-                    logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ 'jobs.failed'.");
-                    client.publish("jobs.failed", null, msg.payload) catch {};
-                    client.ack(&msg) catch {};
-                    _ = job_arena.reset(.retain_capacity);
-                    continue;
-                };
-                _ = parsed;
-
-                // Acknowledge the job
-                client.ack(&msg) catch {
+                if (!handleJob(&client, ctx, &msg, job_alloc, &job_arena, &latency_sum, &processed_in_batch)) {
                     break;
-                };
-
-                // Increment atomic counter
-                _ = total_jobs.fetchAdd(1, .monotonic);
-
-                // Latency execution check
-                const job_end = std.Io.Timestamp.now(ctx.io, .awake);
-                const latency = job_start.durationTo(job_end);
-                const latency_ms = latency.toMilliseconds();
-                latency_sum += latency_ms;
-                processed_in_batch += 1;
-
-                if (latency_ms > 500) {
-                    var lat_buf: [64]u8 = undefined;
-                    const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
-                    logJSON("warn", ctx.thread_id, lat_msg);
                 }
-
-                // Reset arena for the next job, retaining memory capacity (Zero Allocations!)
-                _ = job_arena.reset(.retain_capacity);
             }
 
-            // Priority Queue Routing Fallback: Poll WORKER_LOW if WORKER_HIGH returned empty
+            // Priority Queue Routing Fallback: Poll LOW if HIGH returned empty
             if (is_high_empty and !should_shutdown.load(.monotonic)) {
                 if (ctx.thread_id > target_threads.load(.monotonic)) {
                     break;
                 }
 
-                client.requestNext("JOBS", "WORKER_LOW", inbox, adaptive_batch) catch |err| {
+                client.requestNext(ctx.stream_name, ctx.consumer_low, inbox, adaptive_batch) catch |err| {
                     var err_buf: [64]u8 = undefined;
                     const err_msg = std.fmt.bufPrint(&err_buf, "requestNext (low) failed: {}. Reconnecting...", .{err}) catch "requestNext failed.";
                     logJSON("warn", ctx.thread_id, err_msg);
@@ -415,36 +534,9 @@ fn workerRun(ctx: *WorkerContext) void {
                         break;
                     }
 
-                    const job_start = std.Io.Timestamp.now(ctx.io, .awake);
-
-                    const parsed = std.json.parseFromSlice(Job, job_alloc, msg.payload, .{}) catch {
-                        logJSON("error", ctx.thread_id, "Job parsing failed. Routing to DLQ 'jobs.failed'.");
-                        client.publish("jobs.failed", null, msg.payload) catch {};
-                        client.ack(&msg) catch {};
-                        _ = job_arena.reset(.retain_capacity);
-                        continue;
-                    };
-                    _ = parsed;
-
-                    client.ack(&msg) catch {
+                    if (!handleJob(&client, ctx, &msg, job_alloc, &job_arena, &latency_sum, &processed_in_batch)) {
                         break;
-                    };
-
-                    _ = total_jobs.fetchAdd(1, .monotonic);
-
-                    const job_end = std.Io.Timestamp.now(ctx.io, .awake);
-                    const latency = job_start.durationTo(job_end);
-                    const latency_ms = latency.toMilliseconds();
-                    latency_sum += latency_ms;
-                    processed_in_batch += 1;
-
-                    if (latency_ms > 500) {
-                        var lat_buf: [64]u8 = undefined;
-                        const lat_msg = std.fmt.bufPrint(&lat_buf, "Job SLA violated: {d}ms execution time", .{latency_ms}) catch "Job SLA violated";
-                        logJSON("warn", ctx.thread_id, lat_msg);
                     }
-
-                    _ = job_arena.reset(.retain_capacity);
                 }
             }
 
@@ -484,7 +576,7 @@ fn metricsServerRun(ctx: *MetricsContext) void {
         return;
     };
 
-    logJSON("info", null, "Metrics Server listening on http://127.0.0.1:8080/metrics");
+    logJSON("info", null, "Metrics Server listening on http://127.0.0.1:8080 (/metrics, /health)");
 
     while (!should_shutdown.load(.monotonic)) {
         var conn = server.accept(ctx.io) catch continue;
@@ -492,20 +584,33 @@ fn metricsServerRun(ctx: *MetricsContext) void {
 
         var read_buf: [1024]u8 = undefined;
         var r = conn.reader(ctx.io, &read_buf);
-        _ = r.interface.takeDelimiter('\n') catch continue;
-
-        const count = ctx.total_jobs.load(.monotonic);
-        var body_buf: [256]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf,
-            \\# HELP zig_jobs_processed_total Total number of jobs processed.
-            \\# TYPE zig_jobs_processed_total counter
-            \\zig_jobs_processed_total {d}
-            \\
-        , .{count}) catch continue;
+        const line_opt = r.interface.takeDelimiter('\n') catch continue;
+        var req = line_opt orelse continue;
+        if (req.len > 0 and req[req.len - 1] == '\r') {
+            req = req[0 .. req.len - 1];
+        }
 
         var write_buf: [512]u8 = undefined;
         var w = conn.writer(ctx.io, &write_buf);
-        w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+
+        if (std.mem.indexOf(u8, req, " /health") != null) {
+            const body = "ok\n";
+            w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        } else if (std.mem.indexOf(u8, req, " /metrics") != null) {
+            const count = ctx.total_jobs.load(.monotonic);
+            var body_buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf,
+                \\# HELP zig_jobs_processed_total Total number of jobs processed.
+                \\# TYPE zig_jobs_processed_total counter
+                \\zig_jobs_processed_total {d}
+                \\
+            , .{count}) catch continue;
+
+            w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        } else {
+            const body = "not found\n";
+            w.interface.print("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        }
         w.interface.flush() catch continue;
     }
     logJSON("info", null, "Metrics Server exited cleanly.");

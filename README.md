@@ -58,18 +58,21 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 *   **Precedence Order:** CLI Flags (`--threads`, `--batch`) **>** Env Variables (`NATS_HOST`, etc.) **>** JSON Config (`config.json`) **>** Default Fallbacks.
 *   **Benefit:** Offers extreme deployment flexibility, aligning with standard Kubernetes container practices (env/args overrides) while maintaining local defaults.
 
-### 5. Error Recovery & Dead Letter Queue (DLQ)
-*   **How it works:** Job handlers are wrapped in robust exception captures. If a payload contains invalid JSON or corrupt data, the parser catches the error, publishes the raw payload to the `jobs.failed` subject (acting as a DLQ), and acknowledges (`+ACK`) the message to prevent queue blocking.
-*   **Benefit:** Prevents malformed messages from causing infinite retries or worker loop crashes, ensuring stream execution remains continuous.
-*   **Important:** `jobs.failed` is published as a plain NATS subject, not a JetStream stream. Messages are fire-and-forget unless you separately create a JetStream stream with the `jobs.failed` subject filter. To persist dead-letter messages, add this to your setup:
+### 5. Error Recovery, NAK Retry & Dead Letter Queue (DLQ)
+*   **How it works:** Invalid JSON / poison payloads are published to the configurable DLQ subject (default `jobs.failed`) and `+ACK`ed so they never block the stream. Handler failures call JetStream **`-NAK`** with an exponential backoff delay (`retry_base_ms * 2^(attempt-1)`, capped by `retry_max_ms`). Consumers are created with `max_deliver` (default `5`) so redelivery stops after the configured attempts.
+*   **Benefit:** Transient failures get automatic retries; permanent poison messages go to the DLQ without infinite loops.
+*   **Important:** The DLQ subject is published as a plain NATS subject by default. Messages are fire-and-forget unless you create a JetStream stream for it:
     ```bash
     nats stream add DEAD_LETTERS --subjects="jobs.failed" --storage=file --retention=limits --max-age=72h
     ```
     Then consume it: `nats sub jobs.failed`
 
-### 6. Zero-Dependency Prometheus Telemetry
-*   **How it works:** Launches a lightweight socket listener in a detached thread that accepts incoming requests on port `8080`. When queried on `/metrics`, it parses the request headers and writes a Prometheus-compliant raw text response: `zig_jobs_processed_total <count>`.
-*   **Benefit:** Eliminates external HTTP library dependencies, reducing binary footprint while providing native integrations with standard monitoring setups.
+### 6. Zero-Dependency Prometheus Telemetry + Health Probes
+*   **How it works:** Launches a lightweight socket listener in a detached thread on port `8080`.
+    *   `GET /metrics` — Prometheus text: `zig_jobs_processed_total <count>`
+    *   `GET /health` — plain `ok` for Kubernetes liveness/readiness probes
+    *   anything else — `404 not found`
+*   **Benefit:** No external HTTP library; native scrape + probe endpoints for production clusters.
 
 ### 7. Secure TLS & Authentication Handshakes
 *   **How it works:** Conditionally wraps the TCP stream in a `std.crypto.tls.Client` using secure system entropy from `std.Io.randomSecure` for the cryptographic handshake. It supports loading root certs via `std.crypto.Certificate.Bundle` for CA validation and serializes authentication fields into the NATS JSON CONNECT handshake.
@@ -87,13 +90,29 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 *   **How it works:** Every operational log event emitted by Tachyon is formatted as a machine-readable JSON object: `{"level":"info","thread_id":2,"message":"..."}`. Log levels include `info`, `warn`, and `error`, and each entry includes the originating thread ID where applicable.
 *   **Benefit:** Enables direct ingestion by cloud-native log aggregators (e.g. Datadog, Loki, CloudWatch, Google Cloud Logging) without any additional parsing plugins or sidecars.
 
-### 11. Graceful Shutdown (SIGINT / Ctrl+C Handler)
-*   **How it works:** Registers a native OS signal handler (`SetConsoleCtrlHandler` on Windows, `SIGINT`/`SIGTERM` on POSIX). When a shutdown signal is received, a global atomic `should_shutdown` flag is set to `true`. All worker threads detect this flag at the top of their pull loop and exit cleanly after finishing any in-progress job. The metrics server also drains cleanly.
+### 11. Graceful Shutdown (SIGINT / SIGTERM / Ctrl+C)
+*   **How it works:** Registers a native OS signal handler — `SetConsoleCtrlHandler` on Windows, `std.posix.sigaction` for `SIGINT`/`SIGTERM` on Linux/macOS. When a shutdown signal is received, a global atomic `should_shutdown` flag is set to `true`. All worker threads detect this flag at the top of their pull loop and exit cleanly after finishing any in-progress job. The metrics/health server also drains cleanly.
 *   **Benefit:** Guarantees zero mid-job data loss on deployments and rolling restarts. Kubernetes `SIGTERM` graceful termination windows are fully respected.
 
 ### 12. Per-Job SLA Latency Alerting
-*   **How it works:** Each job is individually timed from pull acknowledgment to completion using `std.Io.Timestamp`. If a single job execution exceeds **500ms**, a `warn`-level structured log entry is emitted: `{"level":"warn","message":"Job SLA violated: 823ms execution time"}`.
+*   **How it works:** Each job is individually timed from pull to completion using `std.Io.Timestamp`. If a single job execution exceeds **500ms**, a `warn`-level structured log entry is emitted: `{"level":"warn","message":"Job SLA violated: 823ms execution time"}`.
 *   **Benefit:** Provides instant, zero-configuration visibility into outlier jobs and downstream service degradation without requiring external APM tooling.
+
+### 13. Configurable Streams, Consumers & Subjects
+*   **How it works:** Stream name, high/low consumer names, subject wildcards, and DLQ subject are all configurable via `config.json` or environment variables (`STREAM_NAME`, `CONSUMER_HIGH`, `SUBJECT_HIGH`, etc.). Defaults remain `JOBS` / `WORKER_HIGH` / `WORKER_LOW` / `jobs.high.*` / `jobs.low.*` / `jobs.failed`.
+*   **Benefit:** One binary can serve multiple environments or product queues without recompilation.
+
+### 14. Optional Job TTL (Stream `max_age`)
+*   **How it works:** When `job_ttl_seconds` is set to a non-zero value, stream creation includes JetStream `max_age` (seconds converted to nanoseconds). Messages older than the TTL are discarded by the broker.
+*   **Benefit:** Stale work (expired password resets, abandoned carts) never gets processed after it no longer matters. `0` (default) means no expiry.
+
+### 15. Per-Worker Rate Limiting
+*   **How it works:** When `max_jobs_per_second` is set, each worker sleeps `max(1, 1000 / max_jobs_per_second)` ms after a successful job. `0` (default) means unlimited.
+*   **Benefit:** Protects fragile downstream APIs from being hammered at full pull speed.
+
+### 16. Reconnect Backoff with Jitter
+*   **How it works:** On connection failure, workers use exponential reconnect backoff (1s → 30s cap) with ±25% LCG jitter so threads do not reconnect in lockstep after a NATS bounce.
+*   **Benefit:** Avoids thundering-herd reconnect storms against recovering brokers.
 
 ---
 
@@ -114,7 +133,7 @@ graph TD
     CL -.->|2. Fallback Pull if High Empty| WP
 
     WP -->|Increment Processed Count| C[Atomic Job Counter]:::metric
-    M[HTTP Metrics Server /metrics]:::metric -.->|Exposes Counter| C
+    M[HTTP Server /metrics + /health]:::metric -.->|Exposes Counter + Health| C
 ```
 
 ---
@@ -383,9 +402,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Connected successfully!\n", .{});
 
     // 2. Initialize Stream and Priority Consumer Groups
-    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" });
-    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*");
-    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*");
+    // setupJetStream(..., max_age_seconds=0) → no TTL; setupConsumer(..., max_deliver=5)
+    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" }, 0);
+    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*", 5);
+    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*", 5);
     try client.flush(); // Flush socket to ensure NATS registers entities
 
     // 3. Serialize structured JSON data
@@ -585,9 +605,31 @@ Deploy a `config.json` in your working directory:
     "nats_tls": false,
     "nats_ca_path": null,
     "worker_threads": 4,
-    "worker_batch": 100
+    "worker_batch": 100,
+    "stream_name": "JOBS",
+    "consumer_high": "WORKER_HIGH",
+    "consumer_low": "WORKER_LOW",
+    "subject_high": "jobs.high.*",
+    "subject_low": "jobs.low.*",
+    "dlq_subject": "jobs.failed",
+    "max_deliver": 5,
+    "retry_base_ms": 1000,
+    "retry_max_ms": 30000,
+    "job_ttl_seconds": 0,
+    "max_jobs_per_second": 0
 }
 ```
+
+| Field | Default | Description |
+| :--- | :--- | :--- |
+| `stream_name` | `JOBS` | JetStream stream name |
+| `consumer_high` / `consumer_low` | `WORKER_HIGH` / `WORKER_LOW` | Durable pull consumer names |
+| `subject_high` / `subject_low` | `jobs.high.*` / `jobs.low.*` | Subject filters for priority routing |
+| `dlq_subject` | `jobs.failed` | Subject used for poison-message DLQ publishes |
+| `max_deliver` | `5` | JetStream max redeliveries before stop |
+| `retry_base_ms` / `retry_max_ms` | `1000` / `30000` | Exponential NAK backoff range |
+| `job_ttl_seconds` | `0` | Stream `max_age` in seconds (`0` = none) |
+| `max_jobs_per_second` | `0` | Per-worker rate cap (`0` = unlimited) |
 
 ### Environment Variable Overrides
 All config fields can be overridden by setting the following environment variables before launching the worker binary:
@@ -600,6 +642,15 @@ All config fields can be overridden by setting the following environment variabl
 | `NATS_PASS` | `string` | `s3cr3t` | NATS password for authentication |
 | `NATS_TLS` | `bool` | `true` | Enable TLS encrypted transport |
 | `NATS_CA` | `string` | `/etc/certs/ca.pem` | Path to custom CA certificate bundle |
+| `STREAM_NAME` | `string` | `ORDERS` | Override JetStream stream name |
+| `CONSUMER_HIGH` | `string` | `ORDERS_HIGH` | High-priority durable consumer |
+| `CONSUMER_LOW` | `string` | `ORDERS_LOW` | Low-priority durable consumer |
+| `SUBJECT_HIGH` | `string` | `orders.high.*` | High-priority subject filter |
+| `SUBJECT_LOW` | `string` | `orders.low.*` | Low-priority subject filter |
+| `DLQ_SUBJECT` | `string` | `orders.failed` | Dead-letter subject |
+| `MAX_DELIVER` | `integer` | `5` | Max JetStream redeliveries |
+| `JOB_TTL_SECONDS` | `integer` | `86400` | Stream message TTL in seconds |
+| `MAX_JOBS_PER_SECOND` | `integer` | `100` | Per-worker rate limit |
 
 ### CLI Flag Reference
 Flags are parsed last and override all other configuration sources:
@@ -663,16 +714,18 @@ Publish 150,000 test payloads into the stream (routing 80% to high priority, 20%
 zig build run-benchmark-producer -Doptimize=ReleaseFast -- --jobs 150000
 ```
 
-### 4. Fetch Metrics
+### 4. Fetch Metrics & Health
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8080/metrics
+Invoke-RestMethod -Uri http://127.0.0.1:8080/health
 ```
-*Output:*
+*Metrics output:*
 ```prometheus
 # HELP zig_jobs_processed_total Total number of jobs processed.
 # TYPE zig_jobs_processed_total counter
 zig_jobs_processed_total 150000
 ```
+*Health output:* `ok`
 
 ---
 
@@ -844,8 +897,11 @@ ss -tlnp | grep 8080
 ```
 The metrics port is currently hardcoded in `src/worker.zig`. Edit the `startMetricsServer` function to change it.
 
-### Graceful shutdown not working on Linux/macOS
-The current `Ctrl+C` handler uses `SetConsoleCtrlHandler` (Windows-only). On Linux/macOS, SIGINT will terminate the process immediately. POSIX signal handler support (`sigaction`) is planned for a future release.
+### Graceful shutdown on Linux/macOS
+POSIX `SIGINT` and `SIGTERM` are handled via `std.posix.sigaction` (Windows uses `SetConsoleCtrlHandler`). If the process still exits hard, confirm you are running a build that includes this code path and that another process manager is not sending `SIGKILL`.
+
+### Jobs keep redelivering forever
+Check `max_deliver` on the consumer (default `5`). Handler failures NAK with backoff; after `max_deliver` attempts JetStream stops redelivering. Poison JSON always goes to the DLQ and is ACKed (not retried).
 
 ### Dead-letter messages not persisting
 By default, `jobs.failed` is a plain NATS subject with no persistence. To retain failed messages:

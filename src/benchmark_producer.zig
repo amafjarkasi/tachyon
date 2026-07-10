@@ -50,9 +50,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Connected!\n", .{});
 
     // Ensure Stream and Consumers exist
-    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" });
-    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*");
-    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*");
+    try client.setupJetStream("JOBS", &[_][]const u8{ "jobs.high.*", "jobs.low.*" }, 0);
+    try client.setupConsumer("JOBS", "WORKER_HIGH", "jobs.high.*", 5);
+    try client.setupConsumer("JOBS", "WORKER_LOW", "jobs.low.*", 5);
     try client.flush();
 
     // Prepare JSON payload
