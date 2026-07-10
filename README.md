@@ -4,12 +4,38 @@
   <img src="logo_v4.png" alt="Tachyon Logo" width="360" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/amafjarkasi/tachyon/actions/workflows/ci.yml"><img src="https://github.com/amafjarkasi/tachyon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/amafjarkasi/tachyon/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig" alt="Zig 0.16.0"></a>
+  <a href="https://github.com/amafjarkasi/tachyon/releases"><img src="https://img.shields.io/github/v/release/amafjarkasi/tachyon?color=green" alt="Latest Release"></a>
+  <a href="https://github.com/amafjarkasi/tachyon/blob/master/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep%20a%20changelog-orange" alt="Changelog"></a>
+</p>
+
 Tachyon is a zero-dependency, ultra-high-performance background job processing library built natively in **Zig 0.16.0** and powered by the **NATS JetStream** protocol. Engineered for low-latency, mission-critical systems (such as financial transaction processors, telemetry ingest engines, and microsecond-sensitive microservices), Tachyon completely bypasses heavy runtime engines, garbage collectors (GC), and third-party frameworks.
 
 ### Why Tachyon?
 *   **The Zig Edge:** By leveraging Zig's precise control over memory and native target compilation, Tachyon provides deterministic, bare-metal runtime execution. There are no heap allocations on the hot path, preventing memory leaks, garbage collection pauses, and kernel context switching overhead.
 *   **NATS JetStream Power:** Instead of relying on heavy polling mechanisms or complex external databases, Tachyon integrates directly with NATS JetStream. It utilizes JetStream's lightweight, distributed message persistence, wildcard routing capabilities, and pull-based consumer APIs.
 *   **Engineered for Speed:** Using worker-isolated sockets (removing synchronization locks entirely) and reusable arena allocators, Tachyon easily achieves peak consumption rates of nearly **100,000 jobs per second** while maintaining a flat memory profile of less than 5 MB under full load.
+
+---
+
+## 📋 Table of Contents
+
+- [Key Features](#-key-features-technical-details)
+- [System Architecture](#️-system-architecture)
+- [Performance Benchmarks](#-performance-benchmarks--comparisons)
+- [Real-World Use Cases](#-real-world-use-case-patterns-production-code)
+- [Detailed Usage Examples](#-detailed-usage-examples)
+- [Configuration Reference](#️-configuration-reference)
+- [Available Binaries](#-available-binaries)
+- [Getting Started](#️-getting-started)
+- [Production Deployment Guide](#️-production-deployment-guide)
+- [Troubleshooting](#-troubleshooting)
+- [Contributing](#-contributing)
+- [Changelog](#-changelog)
+- [License](#-license)
 
 ---
 
@@ -35,6 +61,11 @@ Tachyon is a zero-dependency, ultra-high-performance background job processing l
 ### 5. Error Recovery & Dead Letter Queue (DLQ)
 *   **How it works:** Job handlers are wrapped in robust exception captures. If a payload contains invalid JSON or corrupt data, the parser catches the error, publishes the raw payload to the `jobs.failed` subject (acting as a DLQ), and acknowledges (`+ACK`) the message to prevent queue blocking.
 *   **Benefit:** Prevents malformed messages from causing infinite retries or worker loop crashes, ensuring stream execution remains continuous.
+*   **Important:** `jobs.failed` is published as a plain NATS subject, not a JetStream stream. Messages are fire-and-forget unless you separately create a JetStream stream with the `jobs.failed` subject filter. To persist dead-letter messages, add this to your setup:
+    ```bash
+    nats stream add DEAD_LETTERS --subjects="jobs.failed" --storage=file --retention=limits --max-age=72h
+    ```
+    Then consume it: `nats sub jobs.failed`
 
 ### 6. Zero-Dependency Prometheus Telemetry
 *   **How it works:** Launches a lightweight socket listener in a detached thread that accepts incoming requests on port `8080`. When queried on `/metrics`, it parses the request headers and writes a Prometheus-compliant raw text response: `zig_jobs_processed_total <count>`.
@@ -594,6 +625,21 @@ NATS_HOST=nats.cluster.local worker.exe --batch 100
 
 ---
 
+## 📦 Available Binaries
+
+Tachyon compiles into three separate executables via `zig build`:
+
+| Binary | Build Target | Description |
+| :--- | :--- | :--- |
+| `worker` | `zig build run-worker` | The main consumer pool — pulls, deserializes, and processes jobs from NATS JetStream using configurable worker threads. This is the primary process you run in production. |
+| `producer` | `zig build run-producer` | A simple single-job enqueuer. Publishes one structured JSON job payload to `jobs.high.email`. Use this for manual testing or as a template for your own producers. |
+| `benchmark-producer` | `zig build run-benchmark-producer -- --jobs N` | A high-throughput stress-test publisher. Publishes N jobs as fast as possible — routing 80% to `jobs.high.*` and 20% to `jobs.low.*` (hardcoded split). Used to benchmark peak throughput. |
+
+> [!NOTE]
+> The 80/20 priority split in `benchmark-producer` is hardcoded. Modify `src/benchmark_producer.zig` to change the routing ratio.
+
+---
+
 ## 🛠️ Getting Started
 
 ### 1. Launch NATS Daemon
@@ -755,3 +801,80 @@ Check health logs:
 journalctl -u tachyon -n 50 -f
 ```
 
+---
+
+## 🔧 Troubleshooting
+
+### Connection refused on port 4222
+**Cause:** NATS server is not running or JetStream is not enabled.
+```bash
+# Verify NATS is running
+nats-server -js
+
+# Check it is listening
+nats server check connection
+```
+
+### `error: JetStream not enabled`
+The NATS server was started without the `-js` flag. Stop it and restart with:
+```bash
+nats-server -js
+```
+
+### TLS handshake failure
+- Verify `nats_tls: true` in config and that the certificate path in `nats_ca_path` is valid.
+- Confirm the server certificate CN/SAN matches the host in `nats_host`.
+- Check that the CA bundle file exists and is readable by the process user.
+
+### Workers not scaling up
+The auto-scaler triggers at **30,000 jobs/sec**. If your queue isn't busy enough, threads won't spawn. To force a scale test:
+```bash
+# Flood the queue first
+zig build run-benchmark-producer -Doptimize=ReleaseFast -- --jobs 200000
+```
+
+### Metrics port 8080 conflict
+If another process is already using port 8080, the metrics server will silently fail to bind. Check:
+```bash
+# Windows
+netstat -ano | findstr :8080
+
+# Linux
+ss -tlnp | grep 8080
+```
+The metrics port is currently hardcoded in `src/worker.zig`. Edit the `startMetricsServer` function to change it.
+
+### Graceful shutdown not working on Linux/macOS
+The current `Ctrl+C` handler uses `SetConsoleCtrlHandler` (Windows-only). On Linux/macOS, SIGINT will terminate the process immediately. POSIX signal handler support (`sigaction`) is planned for a future release.
+
+### Dead-letter messages not persisting
+By default, `jobs.failed` is a plain NATS subject with no persistence. To retain failed messages:
+```bash
+nats stream add DEAD_LETTERS --subjects="jobs.failed" --storage=file --retention=limits --max-age=72h
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide on:
+- Reporting bugs and suggesting features
+- Setting up the development environment
+- Submitting pull requests
+- Code style and commit message conventions
+
+For security vulnerabilities, see [SECURITY.md](SECURITY.md) — please **do not** open a public issue.
+
+---
+
+## 📝 Changelog
+
+All notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+
+Copyright © 2026 Tachyon Authors

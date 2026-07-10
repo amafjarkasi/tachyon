@@ -1,0 +1,10 @@
+{
+    "nats_host": "127.0.0.1",
+    "nats_port": 4222,
+    "nats_user": null,
+    "nats_pass": null,
+    "nats_tls": false,
+    "nats_ca_path": null,
+    "worker_threads": 4,
+    "worker_batch": 100
+}

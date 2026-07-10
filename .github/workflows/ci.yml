@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    name: Build & Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Check formatting
+        run: zig fmt --check src/
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Verify binaries exist (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          test -f zig-out/bin/worker
+          test -f zig-out/bin/producer
+          test -f zig-out/bin/benchmark-producer
+          echo "All binaries verified."
+
+      - name: Verify binaries exist (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Test-Path zig-out/bin/worker.exe
+          Test-Path zig-out/bin/producer.exe
+          Test-Path zig-out/bin/benchmark-producer.exe
+          Write-Host "All binaries verified."
+        shell: pwsh
