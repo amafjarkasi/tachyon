@@ -27,12 +27,14 @@ Engineered for low-latency, mission-critical systems — financial clearing, tel
 
 ### Why teams pick Tachyon
 
-| | | |
-| :---: | :---: | :---: |
-| **⚡ Zig edge** | **📡 JetStream native** | **🔒 Zero deps** |
-| Deterministic native code, no GC pauses, full control of every byte on the hot path | Durable streams, pull consumers, priority subjects, explicit ACK / NAK | Only the Zig standard library — no crates, no npm, no Redis sidecar required |
-| **🧵 Socket isolation** | **♻️ Arena reuse** | **🛡️ Production resilience** |
-| One NATS connection per worker thread — no shared-socket mutex | `arena.reset(.retain_capacity)` keeps memory flat under load | Retries, DLQ, circuit breaker, timeouts, dedup, graceful SIGTERM drain |
+| Pillar | What you get |
+| :--- | :--- |
+| **Zig edge** | Deterministic native code, no GC pauses, full control of every byte on the hot path |
+| **JetStream native** | Durable streams, pull consumers, priority subjects, explicit ACK / NAK |
+| **Zero deps** | Only the Zig standard library — no crates, no npm, no Redis sidecar |
+| **Socket isolation** | One NATS connection per worker thread — no shared-socket mutex |
+| **Arena reuse** | `arena.reset(.retain_capacity)` keeps memory flat under load |
+| **Production resilience** | Retries, DLQ, circuit breaker, timeouts, dedup, graceful SIGTERM drain |
 
 ### What you get out of the box
 
